@@ -3071,10 +3071,18 @@ either.
   one Present still refuses waits, unpresented, for the next composition
   while the main thread takes its messages, or gives way to the next frame
   drawn (`holdFrame`, `presentHeld`). One still not taken after `maxHeld`
-  (100 ms), or once the next frame would settle the swap chain, is dropped,
-  and the next frame draws, at once if one waits, or once the window asks
-  for one (`askFrame`): a resize's last frame held for good otherwise left
-  nothing drawing.
+  (100 ms) is dropped, and the next frame draws, at once if one waits, or
+  once the window asks for one (`askFrame`): a resize's last frame held for
+  good otherwise left nothing drawing. After a dropped frame, frames stay
+  paced with the flag until DXGI takes one at once with the swap chain
+  settled (`gaveUp`), and a frame that would resize the buffers, to settle
+  or to grow, is put off a refresh (`resizeWaits`, `putOffFrame`) until
+  DXGI took a frame again (`stalled`, probed by presenting the frame last
+  drawn) and an event query says the GPU drew the frames before
+  (`gpuIdle`): the settle frame after three dropped ones otherwise took
+  994 ms in `ResizeBuffers` or the plain Present after it, waiting on
+  buffers DWM held. Uncapped, the refresh period is read from DWM on
+  another goroutine (`readPeriodAside`).
   With `MYGO_FRAME_STATS` too, the engine logs how many frames came each
   second (`frameStats.rate`), counted anew after a pause or a frame as long
   (250 ms), and each frame's path says uncapped.

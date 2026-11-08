@@ -330,6 +330,10 @@ func TestUncappedResizeWhileDWMStalls(t *testing.T) {
 	defer func(d time.Duration) { settleDelay = d }(settleDelay)
 	pacing.Uncapped = true
 	settleDelay = 400 * time.Millisecond
+	// A frame DXGI refused waits to present for as long as it does here;
+	// TestUncappedRefusedThroughSettle gives one up.
+	defer func(d time.Duration) { maxHeld = d }(maxHeld)
+	maxHeld = wait.Guard
 	// A call to DwmFlush under way from another test returns first.
 	if done := inFlightFlush(); done != nil {
 		wait.For(t, "the window manager", done)
@@ -499,11 +503,15 @@ func TestUncappedResizePresentRefused(t *testing.T) {
 }
 
 // refusingPresent stands for Present: while refuse, it refuses presents
-// with DXGI_PRESENT_DO_NOT_WAIT, counting them, and it counts those it
-// took (presented); flags are those of every call.
+// with DXGI_PRESENT_DO_NOT_WAIT, counting them, and, given stall, waits
+// that long in those without it, as DXGI would for DWM, counting them
+// (waited); it counts those it took (presented); flags are those of every
+// call.
 type refusingPresent struct {
 	refuse             bool
+	stall              time.Duration
 	refused, presented int
+	waited             int
 	flags              []uintptr
 }
 
@@ -521,6 +529,9 @@ func (p *refusingPresent) call(present func(_, _, _ uintptr, _ *presentParameter
 			// busy runner (TestUncappedResizePaced), takes the frame as it
 			// would without the flag.
 			flags &^= presentDoNotWait
+		} else if p.refuse && p.stall > 0 {
+			p.waited++
+			time.Sleep(p.stall)
 		}
 		p.presented++
 		return present(sc, sync, flags, params)
@@ -695,14 +706,12 @@ func presentRefused(t *testing.T, r *Renderer, p *refusingPresent) {
 
 // TestUncappedHeldFrameGivenUp checks that uncapped (MYGO_UNCAPPED), a
 // frame that Present goes on refusing while the window changes size, as
-// at the end of a resize, is given up on once it waited maxHeld, or once
-// the next frame would settle the swap chain, and is never presented, and
-// that frames go on: the frame after, which waits for it, draws then,
-// whole; with none waiting, the window is asked for a frame (askFrame);
-// and the frame that settles the swap chain presents without
-// DXGI_PRESENT_DO_NOT_WAIT, uncapped frames following. Without that bound,
-// a SetWindowPos resize on a Radeon 780M held its last frame, and nothing
-// drew again.
+// at the end of a resize, is given up on once it waited maxHeld, and is
+// never presented, and that frames go on: the frame after, which waits
+// for it, draws then, whole; with none waiting, the window is asked for a
+// frame (askFrame). Without that bound, a SetWindowPos resize on a Radeon
+// 780M held its last frame, and nothing drew again.
+// TestUncappedRefusedThroughSettle has Present refuse past the settle.
 func TestUncappedHeldFrameGivenUp(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -808,6 +817,10 @@ func heldGivenUp(t *testing.T, r *Renderer, p *refusingPresent, asked *int) {
 		if info := r.FrameInfo(); r.redrew != redrewWhole || p.presented != presented+1 || !strings.Contains(info, "after a frame DXGI never took") {
 			t.Fatalf("%s: the frame after one given up on: redrew %v, %d presents, says %q; want whole, one, after a frame given up on", kind, r.redrew, p.presented-presented, info)
 		}
+		if r.stalled || !r.gaveUp || !r.resizing {
+			t.Fatalf("%s: the frame after one given up on, taken: stalled %v, gave up %v, resizing %v; want DXGI taking frames, paced until the swap chain settles",
+				kind, r.stalled, r.gaveUp, r.resizing)
+		}
 		for range 3 {
 			frame(w, h)
 		}
@@ -840,28 +853,267 @@ func heldGivenUp(t *testing.T, r *Renderer, p *refusingPresent, asked *int) {
 		t.Fatalf("%s: the frame asked for after one given up on waits", kind)
 	}
 	next(presented)
+}
 
-	// However long a frame may wait, it is given up on once the next frame
-	// would settle the swap chain, which that frame does, presenting
-	// without DXGI_PRESENT_DO_NOT_WAIT, and the frames after uncapped.
-	maxHeld = wait.Guard
-	resizeEnd()
-	presented = p.presented
-	pump("the frame refused given up on as the swap chain settles", waiting())
-	if r.unpresented || p.presented != presented || time.Since(r.resizedAt) < settleDelay/2 {
-		t.Fatalf("%s: a frame refused as the swap chain settles: unpresented %v, %d presents, %v after the last change; want given up on, none, at least %v",
-			kind, r.unpresented, p.presented-presented, time.Since(r.resizedAt), settleDelay/2)
+// TestUncappedRefusedThroughSettle checks that uncapped (MYGO_UNCAPPED),
+// when Present goes on refusing frames after the window's last change of
+// size, past the time the swap chain would settle, no frame waits on the
+// main thread for DXGI or DWM, and frames go on: the frames given up on
+// (presentHeld) are followed by others, paced, none presenting without
+// DXGI_PRESENT_DO_NOT_WAIT; the buffers resize neither to settle nor to
+// grow, the frames that would being put off (resizeWaits), until DXGI took
+// a frame again and the GPU drew the frames before; then the swap chain
+// settles, though the window draws only the frames asked for, and frames
+// present uncapped again, with tearing where the system has it. Present
+// without the flag and ResizeBuffers wait a second here while Present
+// refuses, as on a Radeon 780M, where a resize's last frames were given up
+// on and the frame that settled the swap chain then took 994 ms.
+func TestUncappedRefusedThroughSettle(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer func(on bool) { pacing.Uncapped = on }(pacing.Uncapped)
+	defer func(d time.Duration) { settleDelay = d }(settleDelay)
+	settleDelay = 400 * time.Millisecond
+	defer func(d time.Duration) { maxHeld = d }(maxHeld)
+	maxHeld = 50 * time.Millisecond
+	defer func(f func(_, _ time.Duration)) { awaitRefresh = f }(awaitRefresh)
+	awaitRefresh = func(_, _ time.Duration) {}
+	asked := 0
+	defer func(f func(uintptr)) { askFrame = f }(askFrame)
+	askFrame = func(uintptr) { asked++ }
+	var p refusingPresent
+	defer func(f func(_, _, _ uintptr, _ *presentParameters) uintptr) { presentCall = f }(presentCall)
+	presentCall = p.call(presentCall)
+	// ResizeBuffers waits as Present without the flag does while Present
+	// refuses frames.
+	var b resizeCounts
+	defer func(f func(_, _, _, _, _ uintptr) uintptr) { resizeBuffersCall = f }(resizeBuffersCall)
+	resizeBuffers := resizeBuffersCall
+	resizeBuffersCall = func(sc, n, w, h, flags uintptr) uintptr {
+		b.resized++
+		if p.refuse {
+			b.waited++
+			time.Sleep(p.stall)
+		}
+		return resizeBuffers(sc, n, w, h, flags)
 	}
-	from := len(p.flags)
-	render(w, h) // Present still refuses DXGI_PRESENT_DO_NOT_WAIT
-	if r.resizing || r.bw != w || r.bh != h || r.unpresented || p.noWait(from) || p.presented != presented+1 {
-		t.Fatalf("%s: settled after a frame given up on: resizing %v, buffers %dx%d, unpresented %v, DXGI_PRESENT_DO_NOT_WAIT %v, %d presents; want %dx%d, presented without it",
-			kind, r.resizing, r.bw, r.bh, r.unpresented, p.noWait(from), p.presented-presented, w, h)
+	defer func(f func(_, _ uintptr) bool) { eventDone = f }(eventDone)
+	eventDone = func(_, _ uintptr) bool { return !b.gpuBusy }
+	pacing.Uncapped = true
+	for _, newRenderer := range []func(uintptr) (*Renderer, error){New, NewComposed} {
+		r, err := newRenderer(hiddenWindow(t, 200, 150))
+		if err != nil {
+			t.Skip("no Direct3D 11:", err)
+		}
+		p = refusingPresent{stall: time.Second}
+		b = resizeCounts{}
+		refusedThroughSettle(t, r, &p, &b, &asked)
+		r.Release()
 	}
-	for range 3 {
-		frame(w, h)
-		if r.refreshing || r.unpresented {
-			t.Fatalf("%s: after the resize, a frame waits (refreshing %v, unpresented %v)", kind, r.refreshing, r.unpresented)
+}
+
+// resizeCounts counts the calls to ResizeBuffers, and those made while
+// Present refused frames (waited); gpuBusy has the GPU not done.
+type resizeCounts struct {
+	resized, waited int
+	gpuBusy         bool
+}
+
+func refusedThroughSettle(t *testing.T, r *Renderer, p *refusingPresent, b *resizeCounts, asked *int) {
+	t.Helper()
+	kind := "window"
+	if r.composed {
+		kind = "composition"
+	}
+	// A refresh, which Present is tried for, and time for a slow machine
+	// to draw, far below the 994 ms seen.
+	tooLong := r.cost.refreshPeriod() + 200*time.Millisecond
+	posted := make(chan func(), 16)
+	r.SetPost(func(f func()) { posted <- f })
+	colors := []scene.Color{{R: 24, G: 24, B: 27, A: 255}, {R: 250, G: 250, B: 250, A: 255}}
+	n := 0
+	// timed runs what the main thread runs, a frame or what the renderer
+	// posted, and checks that it returns soon.
+	timed := func(what string, f func()) {
+		t.Helper()
+		start := time.Now()
+		f()
+		if d := time.Since(start); d > tooLong {
+			t.Errorf("%s: %s took %v (resizing %v, gave up %v, stalled %v); want at most %v", kind, what, d, r.resizing, r.gaveUp, r.stalled, tooLong)
 		}
 	}
+	ready := func() {
+		t.Helper()
+		woke := false
+		if r.Ready(func() { woke = true }) {
+			return
+		}
+		for !woke {
+			timed("what the renderer posted", wait.For(t, kind+": what the frame after waits for", posted))
+		}
+	}
+	// frame draws a frame of w×h once it can, changing what it starts with
+	// and the background, as an animation does.
+	frame := func(w, h int) {
+		t.Helper()
+		ready()
+		n++
+		timed("a frame", func() {
+			if err := r.Render(&scene.Scene{Width: w, Height: h, Clear: colors[n%2], Background: colors[n%2]}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	// served draws the frame the window asked for since the last served,
+	// as for content that does not change, and reports whether there was
+	// one.
+	served := *asked
+	serve := func(w, h int) bool {
+		t.Helper()
+		if *asked == served {
+			return false
+		}
+		served = *asked
+		frame(w, h)
+		return true
+	}
+	frame(200, 150)
+	if r.swapChain2 == 0 {
+		t.Skip("no IDXGISwapChain2: the swap chain resizes whole at each size")
+	}
+	for range 3 {
+		frame(200, 150)
+	}
+	wantTearing := !r.composed && tearingSupported(r.factory)
+	// uncappedAgain checks that frames present uncapped, and with tearing
+	// where the system has it.
+	uncappedAgain := func(w, h int) {
+		t.Helper()
+		from := len(p.flags)
+		for range 5 {
+			frame(w, h)
+			if r.refreshing || r.unpresented {
+				t.Fatalf("%s: after the resize, a frame waits (refreshing %v, unpresented %v)", kind, r.refreshing, r.unpresented)
+			}
+		}
+		if p.noWait(from) || (r.presentFlags(0) == presentTearing) != wantTearing || strings.Contains(r.FrameInfo(), "paced") {
+			t.Fatalf("%s: after the resize: DXGI_PRESENT_DO_NOT_WAIT %v, present flags %#x, says %q; want uncapped, tearing %v",
+				kind, p.noWait(from), r.presentFlags(0), r.FrameInfo(), wantTearing)
+		}
+		for _, f := range p.flags[from:] {
+			if wantTearing && f != presentTearing {
+				t.Fatalf("%s: after the resize, a present with flags %#x; want tearing", kind, f)
+			}
+		}
+	}
+
+	// A live resize, growing past the buffers, whose last frame Present
+	// refuses, and every one after, past the time the swap chain would
+	// settle: frames go on, put off once they would settle it.
+	w, h := 200, 150
+	for range 6 {
+		w, h = w+23, h+11
+		frame(w, h)
+		frame(w, h)
+	}
+	if !r.resizing || r.gaveUp {
+		t.Fatalf("%s: resizing %v, gave up %v; want resizing", kind, r.resizing, r.gaveUp)
+	}
+	p.refuse = true
+	bw, bh := r.bw, r.bh
+	frames, putOff, after := 0, 0, 0
+	for time.Since(r.resizedAt) < settleDelay/2+6*maxHeld {
+		frame(w, h)
+		frames++
+		info := r.FrameInfo()
+		if r.putOff {
+			putOff++
+			if !strings.Contains(info, "put off") {
+				t.Errorf("%s: a frame put off says %q", kind, info)
+			}
+		}
+		if strings.Contains(info, "after a frame DXGI never took") {
+			after++
+		}
+	}
+	t.Logf("%s: %d frames while Present refused, %d after one given up on, %d put off", kind, frames, after, putOff)
+	if !r.resizing || !r.gaveUp || !r.stalled || !r.putOff || r.bw != bw || r.bh != bh || p.waited != 0 || b.waited != 0 {
+		t.Fatalf("%s: Present refusing past the settle: resizing %v, gave up %v, stalled %v, put off %v, buffers %dx%d (were %dx%d), %d presents and %d ResizeBuffers waiting; want resizing, given up, stalled, put off, none waiting",
+			kind, r.resizing, r.gaveUp, r.stalled, r.putOff, r.bw, r.bh, bw, bh, p.waited, b.waited)
+	}
+	if after == 0 || frames < 5 {
+		t.Fatalf("%s: Present refusing past the settle: %d frames, %d after one given up on; want frames going on", kind, frames, after)
+	}
+
+	// Once Present takes frames, the frame put off presents the frame last
+	// drawn, while the GPU is not done yet: the frames that would settle the
+	// swap chain wait for it, though no frame comes but those asked for.
+	p.refuse, b.gpuBusy = false, true
+	presented := p.presented
+	served = *asked
+	frame(w, h) // asked for by the last put off
+	if !r.putOff || r.stalled || p.presented != presented+1 || !r.resizing || r.bw != bw {
+		t.Fatalf("%s: Present taking frames again: put off %v, stalled %v, %d presents, resizing %v, buffers %dx%d; want the frame last drawn presented, the settle put off",
+			kind, r.putOff, r.stalled, p.presented-presented, r.resizing, r.bw, r.bh)
+	}
+	resized := b.resized
+	for range 3 {
+		if !serve(w, h) {
+			t.Fatalf("%s: no frame asked for after one put off", kind)
+		}
+		if !r.putOff || b.resized != resized || !r.resizing || p.presented != presented+1 {
+			t.Fatalf("%s: a frame while the GPU is not done: put off %v, %d ResizeBuffers, resizing %v, %d presents; want put off, none",
+				kind, r.putOff, b.resized-resized, r.resizing, p.presented-presented-1)
+		}
+	}
+	// Once it is, the frame asked for settles the swap chain, and presents
+	// paced, with DXGI_PRESENT_DO_NOT_WAIT, which Present takes at once:
+	// frames present uncapped from then on.
+	b.gpuBusy = false
+	from := len(p.flags)
+	if !serve(w, h) {
+		t.Fatalf("%s: no frame asked for after one put off", kind)
+	}
+	if info := r.FrameInfo(); r.resizing || r.bw != w || r.bh != h || b.resized != resized+1 || r.gaveUp || r.unpresented || !p.noWait(from) || !strings.Contains(info, "paced until DXGI takes a frame at once") {
+		t.Fatalf("%s: settling: resizing %v, buffers %dx%d, %d ResizeBuffers, gave up %v, unpresented %v, DXGI_PRESENT_DO_NOT_WAIT %v, says %q; want settled, %dx%d, one, presented with the flag",
+			kind, r.resizing, r.bw, r.bh, b.resized-resized, r.gaveUp, r.unpresented, p.noWait(from), info, w, h)
+	}
+	uncappedAgain(w, h)
+
+	// Another resize whose last frame Present refuses for good: a frame of a
+	// size the buffers do not hold is put off too, the window showing the
+	// last frame meanwhile, and draws once DXGI takes a frame again; the
+	// settle timer's frame then settles the swap chain.
+	w, h = w+5, h+3
+	frame(w, h)
+	p.refuse = true
+	for !r.gaveUp {
+		frame(w, h)
+	}
+	bw, bh = r.bw, r.bh
+	w2, h2 := bw+40, bh+20
+	frame(w2, h2)
+	if !r.putOff || r.w != w || r.h != h || r.bw != bw || r.bh != bh || b.waited != 0 || p.waited != 0 {
+		t.Fatalf("%s: a %dx%d frame past the %dx%d buffers while Present refuses: put off %v, showing %dx%d, buffers %dx%d, %d ResizeBuffers and %d presents waiting; want put off, showing %dx%d, none waiting",
+			kind, w2, h2, bw, bh, r.putOff, r.w, r.h, r.bw, r.bh, b.waited, p.waited, w, h)
+	}
+	p.refuse = false
+	presented = p.presented
+	frame(w2, h2)
+	if !r.putOff || r.stalled || p.presented != presented+1 {
+		t.Fatalf("%s: a %dx%d frame past the buffers once Present takes frames: put off %v, stalled %v, %d presents; want the frame last drawn presented",
+			kind, w2, h2, r.putOff, r.stalled, p.presented-presented)
+	}
+	frame(w2, h2)
+	if r.putOff || r.w != w2 || r.h != h2 || r.bw < w2 || r.bh < h2 || !r.resizing || !r.gaveUp {
+		t.Fatalf("%s: a %dx%d frame past the buffers once DXGI took one: put off %v, showing %dx%d in %dx%d buffers, resizing %v, gave up %v; want drawn, resizing, paced",
+			kind, w2, h2, r.putOff, r.w, r.h, r.bw, r.bh, r.resizing, r.gaveUp)
+	}
+	time.Sleep(settleDelay/2 - time.Since(r.resizedAt) + 10*time.Millisecond)
+	frame(w2, h2) // the settle timer's
+	if r.resizing || r.bw != w2 || r.bh != h2 || r.gaveUp {
+		t.Fatalf("%s: the settle timer's frame: resizing %v, buffers %dx%d, gave up %v; want settled, %dx%d",
+			kind, r.resizing, r.bw, r.bh, r.gaveUp, w2, h2)
+	}
+	uncappedAgain(w2, h2)
 }

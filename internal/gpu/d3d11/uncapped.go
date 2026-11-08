@@ -90,19 +90,53 @@ import (
 // where DWM may wait on the window's thread: the window shows the last
 // frame at its new size until it presents, a composition or two later,
 // which WARP on a busy CI runner does too. A frame waits so maxHeld at
-// most, or until the next frame would settle the swap chain: then it is
-// given up on, never presented, and the frame after draws, whole, at once
-// if one waits for it, or once the window asks for one (askFrame), as no
-// frame may follow. Without that bound, on the Radeon 780M, 2 runs of 30
-// SetWindowPos resizes held their last frame, and nothing drew for the 2
-// to 3.5 s the app ran on: the frame after waited for it, which never
-// presented, most likely as DXGI took it no sooner, though nothing
-// measured that. Frame stats tell how many times Present said it was still
-// drawing, a frame left to present later, and a frame after one given up
-// on. Nor does the main thread read the refresh period from DWM while the
-// window changes size (show): the period does not change with it. A swap
-// chain that takes no DXGI_PRESENT_DO_NOT_WAIT (DXGI_ERROR_INVALID_CALL)
-// presents without it, waiting as before (noWaitRefused).
+// most: then it is given up on, never presented, and the frame after
+// draws, whole, at once if one waits for it, or once the window asks for
+// one (askFrame), as no frame may follow. Without that bound, on the
+// Radeon 780M, 2 runs of 30 SetWindowPos resizes held their last frame,
+// and nothing drew for the 2 to 3.5 s the app ran on: the frame after
+// waited for it, which never presented, most likely as DXGI took it no
+// sooner, though nothing measured that.
+//
+// Nor does a frame after one given up on wait on DXGI or DWM (gaveUp,
+// stalled). With that bound alone (bac8b96), 39 of 40 SetWindowPos resizes
+// on the Radeon 780M ran clean; in the one run where frames were given up
+// on, three in a row after the last change, the frame that then settled
+// the swap chain took 994 ms in Render, the window alone stopping, and the
+// frames after it came at about 40 a second, some taking two refreshes, at
+// half the usual CPU. That frame did nothing that may wait but
+// ResizeBuffers, which waits for the GPU to be done with the buffers, and
+// Present without DXGI_PRESENT_DO_NOT_WAIT, which waits for the GPU to
+// draw the frame before: no frame latency object (latency.go) is made
+// uncapped, the wait for DWM to show a frame (waitShown) is bounded and
+// off the main thread, and readPeriod comes only every sweepEvery frames.
+// The frames DXGI refused for 100 ms each tell that DWM held the window's
+// buffers, the GPU's work on them waiting for it, and that frame waited
+// for the same, most likely about a second, until DWM let go; which of
+// the two calls waited, nothing measured. The slow frames after look like
+// Present waiting so, a composition or two, while DWM recovered. So after
+// a frame given up on, frames present paced, with
+// DXGI_PRESENT_DO_NOT_WAIT, the swap chain settled or not
+// (presentsUncapped), until DXGI takes one at once with the swap chain
+// settled; and a frame that would resize the buffers, to settle the swap
+// chain or for a size they do not hold, is put off (resizeWaits,
+// putOffFrame) until DXGI took a frame since and the GPU drew all the
+// frames before, as a query ended after them tells, without waiting
+// (gpuIdle): the window shows the last frame meanwhile, and asks for the
+// frame again after a refresh, the frame last drawn, which DXGI never
+// took, presented once with the flag to learn whether DXGI takes frames
+// again; a frame DXGI takes asks for the frame that settles the swap chain
+// should that be due (tookFrame), as the settle timer's may have been put
+// off. A held frame is no longer given up on as the swap chain would
+// settle: the swap chain settles only once DXGI takes frames. Frame stats
+// tell how many times Present said it was still drawing, a frame left to
+// present later, a frame after one given up on, a frame put off, and one
+// paced until DXGI takes a frame at once. Nor does the main thread read
+// the refresh period from DWM uncapped, which may wait for it: another
+// goroutine does (readPeriodAside), and none while the window changes
+// size, as the period does not change with it. A swap chain that takes no
+// DXGI_PRESENT_DO_NOT_WAIT (DXGI_ERROR_INVALID_CALL) presents without it,
+// waiting as before (noWaitRefused).
 //
 // With two buffers, a frame presented with sync interval 0 that DWM has not
 // shown yet holds one and the screen the other, and the next frame waits
@@ -168,14 +202,14 @@ func (r *Renderer) swapChainFlags() uint32 {
 
 // presentFlags returns the flags of a present after sync vertical blanks:
 // tearing's for one at once (sync 0), where the swap chain allows it and
-// frames present uncapped; uncapped, while the window changes size,
-// DXGI_PRESENT_DO_NOT_WAIT, where the frame can present later (post) and
-// the swap chain takes it.
+// frames present uncapped; uncapped, when frames present paced, as while
+// the window changes size, DXGI_PRESENT_DO_NOT_WAIT, where the frame can
+// present later (post) and the swap chain takes it.
 func (r *Renderer) presentFlags(sync uintptr) uintptr {
 	switch {
 	case sync == 0 && r.tearing && r.presentsUncapped():
 		return presentTearing
-	case r.uncapped && r.resizing && r.post != nil && !r.noWaitRefused:
+	case r.uncapped && !r.presentsUncapped() && r.post != nil && !r.noWaitRefused:
 		return presentDoNotWait
 	}
 	return 0
@@ -232,14 +266,15 @@ var askFrame = func(hwnd uintptr) { procInvalidateRect.Call(hwnd, 0, 0) }
 
 // presentHeld presents the frame Present refused (holdFrame), or has it
 // wait again, and reports whether the frame after can draw now. A frame
-// that waited maxHeld, or once the next frame settles the swap chain, is
-// given up on: the frame after draws, whole as DXGI never showed this
-// one, now if it waits (Ready), or once the window asks for it should
-// nothing wait.
+// that waited maxHeld is given up on: the frame after draws, whole as DXGI
+// never showed this one, now if it waits (Ready), or once the window asks
+// for it should nothing wait; and until DXGI takes a frame at once, frames
+// present paced, the buffers resizing only once DXGI took one and the GPU
+// is done with them (resizeWaits).
 func (r *Renderer) presentHeld() bool {
 	r.unpresented = false
-	if time.Since(r.heldAt) >= maxHeld || r.settleDue() {
-		r.dropped = true
+	if time.Since(r.heldAt) >= maxHeld {
+		r.dropped, r.gaveUp, r.stalled = true, true, true
 		askFrame(r.hwnd)
 		return true
 	}
@@ -259,10 +294,111 @@ func (r *Renderer) presentHeld() bool {
 }
 
 // presentsUncapped reports whether frames present without waiting for the
-// display: uncapped (MYGO_UNCAPPED), but while the window changes size,
-// when they present paced.
+// display: uncapped (MYGO_UNCAPPED), but while the window changes size, or
+// after a frame DXGI never took until it takes one at once (gaveUp), when
+// they present paced.
 func (r *Renderer) presentsUncapped() bool {
-	return r.uncapped && !r.resizing
+	return r.uncapped && !r.resizing && !r.gaveUp
+}
+
+// tookFrame notes that DXGI took a frame after one it never took
+// (gaveUp): the buffers can resize once the GPU is done with them, and
+// frames present uncapped again once DXGI took one at once, with the
+// swap chain settled. A frame that settles it is asked for, as the settle
+// timer's may have come while DXGI refused frames, and none may follow.
+func (r *Renderer) tookFrame() {
+	r.stalled = false
+	if !r.resizing {
+		if r.refused == 0 {
+			r.gaveUp = false
+		}
+		return
+	}
+	if r.settleDue() {
+		askFrame(r.hwnd)
+	}
+}
+
+// resizeWaits reports whether a frame of w×h would resize the buffers
+// (resize: to settle the swap chain, or for a size they do not hold) while
+// that may wait: after a frame DXGI never took (gaveUp), until DXGI took a
+// frame since and the GPU drew the frames before (gpuIdle). ResizeBuffers
+// waits for the GPU to be done with the buffers, which may wait for DWM to
+// give them back, as DXGI refusing frames tells it does not.
+func (r *Renderer) resizeWaits(w, h int) bool {
+	if !r.gaveUp || r.swapChain == 0 || r.swapChain2 == 0 {
+		return false
+	}
+	same := w == r.w && h == r.h
+	resizes := same && r.settleDue() || !same && (!r.resizing || w > r.bw || h > r.bh)
+	return resizes && (r.stalled || !r.gpuIdle())
+}
+
+// putOffFrame puts off a frame that would resize the buffers while that
+// may wait (resizeWaits): the window shows the last frame meanwhile, and
+// asks for the frame again after the next refresh. While DXGI took no frame
+// since one it never took (stalled), the frame last drawn, which none
+// showed, presents with DXGI_PRESENT_DO_NOT_WAIT once, to learn whether
+// it takes frames again.
+func (r *Renderer) putOffFrame() {
+	r.putOff = true
+	r.recovering = r.uncapped && !r.resizing
+	if r.stalled {
+		if err := r.show(0); err != nil && err != errStillDrawing && r.failed == nil {
+			r.failed = err // the next frame finds it
+		}
+	}
+	askFrame(r.hwnd)
+	r.waitRefresh()
+}
+
+// eventDone reports whether the GPU reached the event query q, without
+// waiting; tests replace it.
+var eventDone = func(ctx, q uintptr) bool {
+	return call(ctx, ctxGetData, q, 0, 0, 0) == 0 // S_OK, not S_FALSE
+}
+
+// gpuIdle reports whether the GPU drew all the frames drawn, ending the
+// event query that tells it once no frame was drawn since. Without the
+// query, it reports true.
+func (r *Renderer) gpuIdle() bool {
+	if r.idle == 0 {
+		const queryEvent = 0 // D3D11_QUERY_EVENT
+		desc := [2]uint32{queryEvent, 0}
+		if failed(call(r.device, devCreateQuery, uintptr(unsafe.Pointer(&desc)), uintptr(unsafe.Pointer(&r.idle)))) {
+			r.idle = 0
+			return true
+		}
+	}
+	if !r.idleEnded {
+		call(r.ctx, ctxEnd, r.idle)
+		r.idleEnded = true
+	}
+	return eventDone(r.ctx, r.idle)
+}
+
+// readPeriodAside reads the display's refresh period from DWM on another
+// goroutine, as DwmGetCompositionTimingInfo may wait for it, and sets it on
+// the main thread (post). Without post, it reads it at once.
+func (r *Renderer) readPeriodAside() {
+	if r.post == nil {
+		r.cost.readPeriod()
+		return
+	}
+	if r.readingPeriod {
+		return
+	}
+	r.readingPeriod = true
+	post := r.post
+	go func() {
+		p := dwmPeriod()
+		post(func() {
+			r.readingPeriod = false
+			if p != 0 {
+				r.cost.period = p
+			}
+		})
+	}()
 }
 
 // unbindBuffers unbinds the render target views of the swap chain's

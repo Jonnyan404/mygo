@@ -333,13 +333,25 @@ type Renderer struct {
 	// heldAt, refused how many times Present said so this frame, and
 	// noWaitRefused that the swap chain took no DXGI_PRESENT_DO_NOT_WAIT;
 	// dropped tells that the frame held was given up on (presentHeld), and
-	// afterDropped that the frame drawn followed one given up on.
+	// afterDropped that the frame drawn followed one given up on. gaveUp
+	// tells that a frame was given up on and DXGI has taken none at once
+	// since, stalled that it has taken none at all since; putOff that the
+	// frame was put off, as resizing the buffers would have waited
+	// (resizeWaits), and recovering that it presented paced after the
+	// swap chain settled, as gaveUp. idle is the query that tells the
+	// GPU drew what came before it, ended once idleEnded, and
+	// readingPeriod tells that a goroutine reads the refresh period.
 	uncapped, tearing     bool
 	unpresented           bool
 	heldAt                time.Time
 	refused               int
 	noWaitRefused         bool
 	dropped, afterDropped bool
+	gaveUp, stalled       bool
+	putOff, recovering    bool
+	idle                  uintptr
+	idleEnded             bool
+	readingPeriod         bool
 
 	vs, ps, layout      uintptr
 	blend, raster, samp uintptr
@@ -666,7 +678,7 @@ func (r *Renderer) buffers(w, h, bw, bh, n int) error {
 		if r.uncapped {
 			r.unbindBuffers()
 		}
-		if hr := call(r.swapChain, scResizeBuffers, uintptr(n), uintptr(bw), uintptr(bh), 0, uintptr(r.swapChainFlags())); failed(hr) {
+		if hr := resizeBuffersCall(r.swapChain, uintptr(n), uintptr(bw), uintptr(bh), uintptr(r.swapChainFlags())); failed(hr) {
 			return fmt.Errorf("d3d11: cannot resize the swap chain: %#x", uint32(hr))
 		}
 	}
@@ -854,6 +866,7 @@ func (r *Renderer) armSettle() {
 // Release frees the renderer's GPU objects.
 func (r *Renderer) Release() {
 	r.pending, r.refreshing, r.wake, r.unpresented, r.dropped = false, false, nil, false, false
+	r.gaveUp, r.stalled = false, false
 	r.lat.release()
 	r.cost.release()
 	r.b.Release()
@@ -903,7 +916,7 @@ func (r *Renderer) Release() {
 	}
 	// The target goes first: a window has one at most, which another
 	// renderer of it then makes.
-	for _, p := range []*uintptr{&r.visual, &r.target, &r.dcomp, &r.rtv, &r.swapChain2, &r.swapChain, &r.instBuf, &r.cbuf, &r.passCB, &r.samp, &r.raster, &r.overHoleBlend, &r.overBlend, &r.holeBlend, &r.blend, &r.layout,
+	for _, p := range []*uintptr{&r.idle, &r.visual, &r.target, &r.dcomp, &r.rtv, &r.swapChain2, &r.swapChain, &r.instBuf, &r.cbuf, &r.passCB, &r.samp, &r.raster, &r.overHoleBlend, &r.overBlend, &r.holeBlend, &r.blend, &r.layout,
 		&r.blurPS, &r.downPS, &r.passVS, &r.ps, &r.vs, &r.factory, &r.ctx1, &r.ctx, &r.device} {
 		free(p)
 	}
@@ -1023,10 +1036,21 @@ func (r *Renderer) Render(s *scene.Scene) error {
 	// (holdFrame).
 	r.unpresented, r.heldAt, r.refused = false, time.Time{}, 0
 	r.afterDropped, r.dropped = r.dropped, false
+	r.putOff = false
+	if r.resizeWaits(s.Width, s.Height) {
+		// Resizing the buffers would wait for DWM or the GPU, after DXGI
+		// refused frames: the frame is put off (uncapped.go).
+		r.putOffFrame()
+		return nil
+	}
 	resized := r.swapChain != 0 && (s.Width != r.w || s.Height != r.h)
 	drawn, err := r.drawFrame(s)
 	if err != nil {
 		return err
+	}
+	r.recovering = r.uncapped && !r.resizing && r.gaveUp
+	if drawn {
+		r.idleEnded = false
 	}
 	if !drawn {
 		if !r.presentsUncapped() {
@@ -1040,9 +1064,10 @@ func (r *Renderer) Render(s *scene.Scene) error {
 	// takes its next size, as the user drags its border, with the frame of
 	// that size, rather than show older frames stretched to it (waitShown).
 	// Uncapped, every frame presents at once, and the next follows, but
-	// while the window changes size, when each frame waits for the
-	// composition that shows it, and the frame of a new size for DWM at most
-	// two refreshes, none of them waiting in Present long (uncapped.go).
+	// while the window changes size, or DXGI takes no frame at once after
+	// one it never took, when each frame waits for the composition that
+	// shows it, and the frame of a new size for DWM at most two refreshes,
+	// none of them waiting in Present long (uncapped.go).
 	sync := uintptr(1)
 	if resized || r.presentsUncapped() {
 		sync = 0
@@ -1906,16 +1931,27 @@ func (r *Renderer) show(sync uintptr) error {
 	// window made hidden, may not be what the window shows once it does:
 	// the next frame draws whole.
 	r.held = r.ctx1 != 0 && uint32(hr) != dxgiStatusOccluded
+	if r.gaveUp {
+		r.tookFrame()
+	}
 	if r.frame-r.swept >= sweepEvery {
 		r.swept = r.frame
 		r.sweep()
-		if !r.uncapped || !r.resizing {
-			// Uncapped, while the window changes size, the main thread
-			// makes no call to DWM that may wait (uncapped.go).
+		switch {
+		case !r.uncapped:
 			r.cost.readPeriod()
+		case !r.resizing:
+			// Uncapped, the main thread makes no call to DWM that may
+			// wait (uncapped.go).
+			r.readPeriodAside()
 		}
 	}
 	return nil
+}
+
+// resizeBuffersCall calls ResizeBuffers; tests replace it.
+var resizeBuffersCall = func(swapChain, n, w, h, flags uintptr) uintptr {
+	return call(swapChain, scResizeBuffers, n, w, h, 0, flags)
 }
 
 // presentCall calls Present, or Present1 with params when the frame drew
@@ -1930,23 +1966,33 @@ var presentCall = func(swapChain, sync, flags uintptr, params *presentParameters
 // FrameInfo describes the last frame for MYGO_FRAME_STATS.
 func (r *Renderer) FrameInfo() string {
 	info := r.b.Summary()
-	switch r.redrew {
-	case redrewPart:
+	switch {
+	case r.putOff:
+		info = "put off until DXGI and the GPU are done with the frames before"
+	case r.redrew == redrewPart:
 		info = fmt.Sprintf("redrew %s, %s", r.part.String(), info)
-	case redrewNothing:
+	case r.redrew == redrewNothing:
 		info = "unchanged"
 	}
+	paced := true
 	switch {
 	case r.uncapped && r.resizing:
 		info += ", paced while resizing"
+	case r.recovering:
+		info += ", paced until DXGI takes a frame at once"
+	case r.tearing:
+		info += ", tearing allowed"
+		paced = false
+	default:
+		paced = false
+	}
+	if paced {
 		if r.refused > 0 {
 			info += fmt.Sprintf(", Present still drawing %d times", r.refused)
 		}
 		if r.unpresented {
 			info += ", presenting once DXGI can"
 		}
-	case r.tearing:
-		info += ", tearing allowed"
 	}
 	if r.afterDropped {
 		info += ", after a frame DXGI never took"
