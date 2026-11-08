@@ -3071,17 +3071,22 @@ either.
   one Present still refuses waits, unpresented, for the next composition
   while the main thread takes its messages, or gives way to the next frame
   drawn (`holdFrame`, `presentHeld`). One still not taken after `maxHeld`
-  (100 ms) is dropped, and the next frame draws, at once if one waits, or
-  once the window asks for one (`askFrame`): a resize's last frame held for
-  good otherwise left nothing drawing. After a dropped frame, frames stay
-  paced with the flag until DXGI takes one at once with the swap chain
-  settled (`gaveUp`), and a frame that would resize the buffers, to settle
-  or to grow, is put off a refresh (`resizeWaits`, `putOffFrame`) until
-  DXGI took a frame again (`stalled`, probed by presenting the frame last
-  drawn) and an event query says the GPU drew the frames before
-  (`gpuIdle`): the settle frame after three dropped ones otherwise took
-  994 ms in `ResizeBuffers` or the plain Present after it, waiting on
-  buffers DWM held. Uncapped, the refresh period is read from DWM on
+  (100 ms) presents without the flag, waiting as long as DXGI has it, on
+  another goroutine (`presentAside`, `goAside`), and until DXGI takes a
+  frame at once with the swap chain settled (`gaveUp`), frames stay paced
+  with the flag and the buffers resize, to settle or to grow, on another
+  goroutine too (`resizeAside`). Meanwhile the main thread makes no call
+  to the context nor the swap chain: a frame drawn then is put off, the
+  frame after waits (`Ready`), `Release` waits for the call, and once it
+  returned the frame after draws, or the window is asked for one
+  (`askFrame`). A resize's last frame held for good otherwise left nothing
+  drawing; dropping it and drawing on had the settle frame take 994 ms on
+  the main thread, in `ResizeBuffers` or a plain Present; and putting such
+  frames off until DXGI took one with the flag and an event query said the
+  GPU was done, waiting on nothing (0338404), put every frame off for good
+  in 4 resizes of 70: nothing the app did without waiting ended DXGI's
+  refusal, while the call that waited did, so such a call is now made, off
+  the main thread. Uncapped, the refresh period is read from DWM on
   another goroutine (`readPeriodAside`).
   With `MYGO_FRAME_STATS` too, the engine logs how many frames came each
   second (`frameStats.rate`), counted anew after a pause or a frame as long
