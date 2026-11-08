@@ -877,16 +877,31 @@ func (r *Renderer) armSettle() {
 	procSetTimer.Call(r.hwnd, settleTimer, uintptr(settleDelay/time.Millisecond), settleProc)
 }
 
+// releaseWait is how long Release waits at most for a call to the swap
+// chain that another goroutine makes (goAside).
+const releaseWait = 2 * time.Second
+
 // Release frees the renderer's GPU objects.
 func (r *Renderer) Release() {
-	if r.asideEnded != nil {
+	if ended := r.asideEnded; ended != nil {
 		// The call another goroutine makes to the swap chain returns
-		// before the swap chain goes.
-		<-r.asideEnded
-		r.asideEnded = nil
+		// before the swap chain goes. DXGI may send the window a message
+		// meanwhile, which the main thread does not take while it waits
+		// here: past releaseWait, the GPU objects are left to the
+		// process's end rather than the main thread wait on.
+		r.asideEnded, r.aside = nil, ""
+		select {
+		case <-ended:
+		case <-time.After(releaseWait):
+			if settling[r.hwnd] {
+				delete(settling, r.hwnd)
+				procKillTimer.Call(r.hwnd, settleTimer)
+			}
+			return
+		}
 	}
 	r.pending, r.refreshing, r.wake, r.unpresented = false, false, nil, false
-	r.gaveUp, r.aside = false, ""
+	r.gaveUp = false
 	r.lat.release()
 	r.cost.release()
 	r.b.Release()

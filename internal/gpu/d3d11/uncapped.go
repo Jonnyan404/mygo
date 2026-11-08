@@ -106,7 +106,9 @@ import (
 // which it may not while another thread does: it goes back to the
 // window's messages, a frame drawn meanwhile, as one of a new size within
 // SetWindowPos, is put off, the window showing the last frame, the frame
-// after waits for the call (Ready), and Release waits for it to return.
+// after waits for the call (Ready), and Release waits for it to return,
+// releaseWait at most, past which it leaves the GPU objects to the
+// process's end: DXGI may send the window a message meanwhile.
 // Once it returned, the frame after draws, at once if one waits, or once
 // the window asks for one (askFrame), as the settle timer's may have been
 // put off. DXGI refusing frames was not ended by anything the app did
@@ -342,7 +344,7 @@ func (r *Renderer) resizeAside(w, h, bw, bh, n int) {
 // what, which may wait for DWM, and then runs done with what it returned
 // on the main thread (post). Meanwhile, the main thread makes no call to the
 // device's context nor the swap chain: a frame is put off (Render), the
-// frame after waits (Ready), and Release waits for fn to return. Once it
+// frame after waits (Ready), and Release waits for fn (releaseWait). Once it
 // did, the frame after draws, at once if one waits, or once the window
 // asks for one (askFrame).
 func (r *Renderer) goAside(what string, fn func() uintptr, done func(hr uintptr) error) {

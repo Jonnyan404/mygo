@@ -3077,9 +3077,9 @@ either.
   with the flag and the buffers resize, to settle or to grow, on another
   goroutine too (`resizeAside`). Meanwhile the main thread makes no call
   to the context nor the swap chain: a frame drawn then is put off, the
-  frame after waits (`Ready`), `Release` waits for the call, and once it
-  returned the frame after draws, or the window is asked for one
-  (`askFrame`). A resize's last frame held for good otherwise left nothing
+  frame after waits (`Ready`), `Release` waits for the call (2 s at
+  most), and once it returned the frame after draws, or the window is
+  asked for one (`askFrame`). A resize's last frame held for good otherwise left nothing
   drawing; dropping it and drawing on had the settle frame take 994 ms on
   the main thread, in `ResizeBuffers` or a plain Present; and putting such
   frames off until DXGI took one with the flag and an event query said the
