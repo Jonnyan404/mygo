@@ -21,7 +21,7 @@ import "unsafe"
 // While the window changes size, from its first change until the swap
 // chain settles (resize, settleDelay), frames present paced
 // (presentsUncapped), as without MYGO_UNCAPPED: none with tearing, a frame
-// of a new size waiting for DWM to show it (Render, DwmFlush), the others
+// of a new size waiting for DWM to show it (Render, waitShown), the others
 // each waiting for the composition that shows it (waitComposed), and one
 // that changed nothing for the next refresh (waitRefresh). Uncapped, a live
 // resize had one present take 2 s, on a Radeon 780M and a 59 Hz display,
@@ -35,6 +35,24 @@ import "unsafe"
 // waits behind them. Paced, at most one frame a composition reaches DWM.
 // Before ResizeBuffers, no view of the buffers stays bound (unbindBuffers),
 // as DXGI asks.
+//
+// Unlike a paced frame of a new size, which calls DwmFlush on the main
+// thread and returns once DWM composed, an uncapped one waits for DWM at
+// most two refreshes, DwmFlush called on another thread (awaitRefresh,
+// shared with waitComposed's): every wait of an uncapped frame on DWM is
+// bounded. With that wait unbounded, a resize the app made with
+// SetWindowPos every 50 ms still had one present take 2.0 s, at its first
+// frame or after its last change, on the Radeon 780M, though its other
+// frames presented paced, while the same resize without MYGO_UNCAPPED,
+// and a drag of the window's edge uncapped, had none. The frame of a new size draws
+// within SetWindowPos (WM_SIZE), and its DwmFlush was the only wait of an
+// uncapped frame with no bound: it returns at DWM's next composition,
+// which frames flipped to the screen torn, as the uncapped ones before the
+// resize, do not bring about, and DWM may itself wait on the window's
+// thread while the window changes size; 2 s exactly looks like the end of
+// such a wait. A frame that waits for DWM no longer than two refreshes,
+// and then returns to the window's messages, leaves DWM nothing to wait
+// on, and a composition missed costs it two refreshes.
 //
 // With two buffers, a frame presented with sync interval 0 that DWM has not
 // shown yet holds one and the screen the other, and the next frame waits

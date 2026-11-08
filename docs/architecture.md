@@ -3058,9 +3058,14 @@ either.
   size until the swap chain settles (`presentsUncapped`): no tearing, a
   frame of a new size waiting for DWM to show it and the others for the
   composition that shows each, as uncapped frames queued for DWM while it
-  resized the window, and one present took 2 s. With
-  `MYGO_FRAME_STATS` too, the engine logs how many frames came each second
-  (`frameStats.rate`), and each frame's path says uncapped.
+  resized the window, and one present took 2 s. Each of those waits is
+  bounded, the frame of a new size's at two refreshes, with DwmFlush called
+  on another thread (`waitShown`): called on the main thread within
+  `SetWindowPos`, it was the one wait with no bound when a present took
+  2 s at the start or end of a resize the app made.
+  With `MYGO_FRAME_STATS` too, the engine logs how many frames came each
+  second (`frameStats.rate`), counted anew after a pause or a frame as long
+  (250 ms), and each frame's path says uncapped.
 - **Video of the system's media framework** (`ui/video`,
   `ui/engine_video.go`, `internal/media`, `scene.Surface`). A
   `media.Engine` plays one video: AVFoundation's `AVPlayer` with an

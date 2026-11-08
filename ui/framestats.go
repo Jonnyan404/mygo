@@ -187,8 +187,15 @@ func (f *frameStats) end(rt *engine) {
 // (MYGO_UNCAPPED), and once they followed each other for a second, logs how
 // many came a second and counts anew: the frame rate, which the display's
 // refreshes no longer cap, tells how much of a refresh a scene leaves. A
-// pause longer than rateGap starts the count anew.
+// pause longer than rateGap starts the count anew, and so does a frame
+// that took longer, as one that waited on the system, which the frame's
+// own line tells: counted, it would have the second it ends in log a few
+// frames a second, as if the frames after it still came that slowly.
 func (f *frameStats) rate(start, end time.Time) {
+	if end.Sub(start) > rateGap {
+		f.rateFrom, f.rateFrames, f.rateLast = end, 0, end
+		return
+	}
 	if f.rateFrom.IsZero() || start.Sub(f.rateLast) > rateGap {
 		f.rateFrom, f.rateFrames = start, 0
 	}

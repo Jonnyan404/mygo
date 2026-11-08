@@ -236,3 +236,135 @@ func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32) {
 		t.Fatalf("%s: after the resize, present flags %#x, frame %q", kind, r.presentFlags(0), r.FrameInfo())
 	}
 }
+
+// TestUncappedResizeWhileDWMStalls checks that uncapped (MYGO_UNCAPPED),
+// no frame of a live resize waits long for DWM on the main thread, whose
+// messages DWM may wait on, though DWM composes nothing for as long as the
+// test runs: a frame of a new size waits for it at most two refreshes
+// (waitShown), DwmFlush called on another thread, and the others not at
+// all, from the uncapped frames before the resize, through its first frame
+// and its last change, to the uncapped frames once the swap chain settled.
+// A resize the app made with SetWindowPos had a present take 2 s on a
+// Radeon 780M, at its first frame or after its last change, while the
+// frame of a new size called DwmFlush on the main thread.
+func TestUncappedResizeWhileDWMStalls(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer func(on bool) { pacing.Uncapped = on }(pacing.Uncapped)
+	defer func(d time.Duration) { settleDelay = d }(settleDelay)
+	pacing.Uncapped = true
+	settleDelay = 400 * time.Millisecond
+	// A call to DwmFlush under way from another test returns first.
+	if done := inFlightFlush(); done != nil {
+		wait.For(t, "the window manager", done)
+	}
+	stalled := make(chan struct{})
+	defer func(f func()) {
+		close(stalled)
+		// The call under way returns before DwmFlush is called again.
+		for done := inFlightFlush(); done != nil; done = inFlightFlush() {
+			<-done
+		}
+		dwmFlushCall = f
+	}(dwmFlushCall)
+	dwmFlushCall = func() { <-stalled }
+	// Count the waits of frames of a new size, the only ones with no least.
+	var shown atomic.Int32
+	defer func(f func(_, _ time.Duration)) { awaitRefresh = f }(awaitRefresh)
+	await := awaitRefresh
+	awaitRefresh = func(least, most time.Duration) {
+		if least == 0 {
+			shown.Add(1)
+		}
+		await(least, most)
+	}
+	for _, newRenderer := range []func(uintptr) (*Renderer, error){New, NewComposed} {
+		r, err := newRenderer(hiddenWindow(t, 200, 150))
+		if err != nil {
+			t.Skip("no Direct3D 11:", err)
+		}
+		resizeWhileDWMStalls(t, r, &shown)
+		r.Release()
+	}
+}
+
+// inFlightFlush returns what closes once the call to DwmFlush under way
+// returns, nil for none.
+func inFlightFlush() <-chan struct{} {
+	dwmFlush.Lock()
+	defer dwmFlush.Unlock()
+	return dwmFlush.done
+}
+
+func resizeWhileDWMStalls(t *testing.T, r *Renderer, shown *atomic.Int32) {
+	t.Helper()
+	kind := "window"
+	if r.composed {
+		kind = "composition"
+	}
+	posted := make(chan func(), 16)
+	r.SetPost(func(f func()) { posted <- f })
+	// Two refreshes, the longest a frame waits, and time for a slow
+	// machine to draw, far below the 2 s seen.
+	tooLong := 2*r.cost.refreshPeriod() + 200*time.Millisecond
+	colors := []scene.Color{{R: 24, G: 24, B: 27, A: 255}, {R: 250, G: 250, B: 250, A: 255}}
+	n := 0
+	// frame draws a frame of w×h, changing the background, once it can, as
+	// the window host has it wait: the waits for a composition end at their
+	// bound.
+	frame := func(w, h int) {
+		t.Helper()
+		woke := false
+		if !r.Ready(func() { woke = true }) {
+			for !woke {
+				wait.For(t, kind+": the composition a frame waits for, or its bound", posted)()
+			}
+		}
+		n++
+		start := time.Now()
+		if err := r.Render(&scene.Scene{Width: w, Height: h, Background: colors[n%2]}); err != nil {
+			t.Fatal(err)
+		}
+		if d := time.Since(start); d > tooLong {
+			t.Errorf("%s: a %dx%d frame took %v, resizing %v; want at most %v", kind, w, h, d, r.resizing, tooLong)
+		}
+	}
+	frame(200, 150)
+	if r.swapChain2 == 0 {
+		t.Skip("no IDXGISwapChain2: the swap chain resizes whole at each size")
+	}
+	for range 10 {
+		frame(200, 150) // uncapped, with tearing where the system has it
+	}
+	// Growing, past the buffers too, and shrinking within them.
+	w, h := 200, 150
+	for i := range 12 {
+		if i%4 == 3 {
+			w, h = w-13, h-7
+		} else {
+			w, h = w+17, h+9
+		}
+		before := shown.Load()
+		frame(w, h)
+		if !r.resizing || shown.Load() != before+1 {
+			t.Fatalf("%s: a %dx%d frame of a new size: resizing %v, %d waits for DWM to show it; want resizing, one",
+				kind, w, h, r.resizing, shown.Load()-before)
+		}
+		frame(w, h)
+		frame(w, h)
+	}
+	// The frames after the last change, until one settles the swap chain.
+	for end := time.Now().Add(settleDelay/2 + 20*time.Millisecond); time.Now().Before(end); {
+		frame(w, h)
+	}
+	frame(w, h)
+	if r.resizing || r.bw != w || r.bh != h {
+		t.Fatalf("%s: settled: resizing %v, buffers %dx%d; want %dx%d", kind, r.resizing, r.bw, r.bh, w, h)
+	}
+	for range 10 {
+		frame(w, h)
+		if r.refreshing {
+			t.Fatalf("%s: after the resize, a frame waits for a composition", kind)
+		}
+	}
+}

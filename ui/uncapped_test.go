@@ -102,7 +102,7 @@ func TestUncappedIdleAsksNoFrame(t *testing.T) {
 
 // TestUncappedFrameRate checks the line MYGO_FRAME_STATS logs uncapped:
 // how many frames came a second, once they followed each other for a
-// second, counted anew after a pause.
+// second, counted anew after a pause or a frame as long.
 func TestUncappedFrameRate(t *testing.T) {
 	var logged []string
 	defer func(f func(...any)) { frameLog = f }(frameLog)
@@ -132,7 +132,27 @@ func TestUncappedFrameRate(t *testing.T) {
 		t.Fatalf("the pause counted: %q", logged)
 	}
 	f.rate(at, at.Add(10*time.Millisecond))
+	at = at.Add(10 * time.Millisecond)
 	if len(logged) != 2 || !strings.Contains(logged[1], "100 frames a second") {
 		t.Fatalf("after the pause: %q", logged)
+	}
+	// A frame that took 2 s, as a present that waited on the system, is a
+	// pause too: the second it ends in counts the frames after it only,
+	// not a few frames a second.
+	for range 50 {
+		f.rate(at, at.Add(10*time.Millisecond))
+		at = at.Add(10 * time.Millisecond)
+	}
+	f.rate(at, at.Add(2*time.Second))
+	at = at.Add(2 * time.Second)
+	if len(logged) != 2 {
+		t.Fatalf("the long frame counted: %q", logged)
+	}
+	for range 1000 {
+		f.rate(at, at.Add(time.Millisecond))
+		at = at.Add(time.Millisecond)
+	}
+	if len(logged) != 3 || !strings.Contains(logged[2], "1000 frames a second") {
+		t.Fatalf("after the long frame: %q", logged)
 	}
 }

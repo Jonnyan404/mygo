@@ -1014,10 +1014,11 @@ func (r *Renderer) Render(s *scene.Scene) error {
 	// after the frame queued before it, which would miss the next
 	// composition, and waits until the compositor shows it: the window
 	// takes its next size, as the user drags its border, with the frame of
-	// that size, rather than show older frames stretched to it. Uncapped,
-	// every frame presents at once, and the next follows, but while the
-	// window changes size, when each frame waits for the composition that
-	// shows it (uncapped.go).
+	// that size, rather than show older frames stretched to it (waitShown).
+	// Uncapped, every frame presents at once, and the next follows, but
+	// while the window changes size, when each frame waits for the
+	// composition that shows it, and the frame of a new size for DWM at most
+	// two refreshes (uncapped.go).
 	sync := uintptr(1)
 	if resized || r.presentsUncapped() {
 		sync = 0
@@ -1052,7 +1053,7 @@ func (r *Renderer) Render(s *scene.Scene) error {
 		return err
 	}
 	if resized {
-		procDwmFlush.Call()
+		r.waitShown()
 	}
 	return nil
 }
@@ -1757,7 +1758,7 @@ func dwmFlushed() <-chan struct{} {
 		done := make(chan struct{})
 		dwmFlush.done = done
 		go func() {
-			procDwmFlush.Call()
+			dwmFlushCall()
 			dwmFlush.Lock()
 			dwmFlush.done = nil
 			dwmFlush.Unlock()
@@ -1765,6 +1766,20 @@ func dwmFlushed() <-chan struct{} {
 		}()
 	}
 	return dwmFlush.done
+}
+
+// dwmFlushCall returns once DWM composed (DwmFlush); tests replace it.
+var dwmFlushCall = func() { procDwmFlush.Call() }
+
+// waitShown has a frame of a new size wait for DWM to show it (Render):
+// paced, on the main thread until it has; uncapped, at most two refreshes,
+// the call made on another thread (uncapped.go).
+func (r *Renderer) waitShown() {
+	if !r.uncapped {
+		dwmFlushCall()
+		return
+	}
+	awaitRefresh(0, 2*r.cost.refreshPeriod())
 }
 
 // minRefresh and maxRefresh bound awaitRefresh's wait: a 60 Hz refresh's
