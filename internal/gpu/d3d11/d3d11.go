@@ -26,6 +26,7 @@ import (
 
 	"github.com/egoist/mygo/internal/gpu"
 	"github.com/egoist/mygo/internal/gpu/d3d11/device"
+	"github.com/egoist/mygo/internal/pacing"
 	"github.com/egoist/mygo/internal/scene"
 )
 
@@ -325,6 +326,9 @@ type Renderer struct {
 	// the main thread, once the screen has room for the frame Ready held back.
 	cost      frameCost
 	wakeLater func()
+	// uncapped tells that frames present without waiting for the display
+	// (uncapped.go), and tearing that they present with tearing.
+	uncapped, tearing bool
 
 	vs, ps, layout      uintptr
 	blend, raster, samp uintptr
@@ -421,7 +425,7 @@ func newRenderer(hwnd uintptr, composed bool) (*Renderer, error) {
 	if hwnd == 0 {
 		return nil, errors.New("d3d11: no window")
 	}
-	r := &Renderer{hwnd: hwnd, composed: composed, images: map[uint64]*texture{}}
+	r := &Renderer{hwnd: hwnd, composed: composed, uncapped: pacing.Uncapped, images: map[uint64]*texture{}}
 	var err error
 	if r.device, r.ctx, r.warp, err = device.New(); err != nil {
 		return nil, err
@@ -461,6 +465,9 @@ func (r *Renderer) init() error {
 	if failed(call(adapter, dxgiGetParent, uintptr(unsafe.Pointer(&iidIDXGIFactory2)), uintptr(unsafe.Pointer(&r.factory)))) {
 		return errors.New("d3d11: DXGI 1.2 is required")
 	}
+	// The window's swap chain presents with tearing, uncapped, where the
+	// system can (uncapped.go).
+	r.tearing = r.uncapped && !r.composed && tearingSupported(r.factory)
 
 	code, err := shaderCode()
 	if err != nil {
@@ -588,9 +595,14 @@ func (r *Renderer) resize(w, h int) error {
 func (r *Renderer) buffers(w, h, bw, bh, n int) error {
 	free(&r.rtv)
 	r.held = false
+	if r.uncapped {
+		// A frame replaces the one queued rather than wait for the screen
+		// to give a buffer back (uncapped.go).
+		n = max(n, uncappedBuffers)
+	}
 	if r.swapChain == 0 {
 		desc := swapChainDesc1{Width: uint32(bw), Height: uint32(bh), Format: formatB8G8R8A8Unorm, SampleCount: 1,
-			BufferUsage: 0x20, BufferCount: uint32(n), Scaling: scalingStretch, SwapEffect: 3 /* flip sequential */, Flags: swapChainWaitable}
+			BufferUsage: 0x20, BufferCount: uint32(n), Scaling: scalingStretch, SwapEffect: 3 /* flip sequential */, Flags: r.swapChainFlags()}
 		if r.composed {
 			if err := r.composeSwapChain(desc); err != nil {
 				return err
@@ -601,12 +613,22 @@ func (r *Renderer) buffers(w, h, bw, bh, n int) error {
 			// where the window grew before the frame of its new size
 			// presents, DWM shows the content's background, not black,
 			// nor the last frame stretched.
-			desc.Scaling = scalingNone
-			hr := call(r.factory, factoryCreateSwapChainHwnd, r.device, r.hwnd, uintptr(unsafe.Pointer(&desc)), 0, 0, uintptr(unsafe.Pointer(&r.swapChain)))
-			r.unscaled = !failed(hr)
-			if failed(hr) {
-				desc.Scaling = scalingStretch
-				hr = call(r.factory, factoryCreateSwapChainHwnd, r.device, r.hwnd, uintptr(unsafe.Pointer(&desc)), 0, 0, uintptr(unsafe.Pointer(&r.swapChain)))
+			create := func() uintptr {
+				desc.Scaling = scalingNone
+				hr := call(r.factory, factoryCreateSwapChainHwnd, r.device, r.hwnd, uintptr(unsafe.Pointer(&desc)), 0, 0, uintptr(unsafe.Pointer(&r.swapChain)))
+				r.unscaled = !failed(hr)
+				if failed(hr) {
+					desc.Scaling = scalingStretch
+					hr = call(r.factory, factoryCreateSwapChainHwnd, r.device, r.hwnd, uintptr(unsafe.Pointer(&desc)), 0, 0, uintptr(unsafe.Pointer(&r.swapChain)))
+				}
+				return hr
+			}
+			hr := create()
+			if failed(hr) && r.tearing {
+				// A swap chain refused with tearing is made without.
+				r.tearing = false
+				desc.Flags = r.swapChainFlags()
+				hr = create()
 			}
 			if failed(hr) {
 				return fmt.Errorf("d3d11: cannot create the swap chain: %#x", uint32(hr))
@@ -615,13 +637,13 @@ func (r *Renderer) buffers(w, h, bw, bh, n int) error {
 			call(r.factory, factoryMakeWindowAssoc, r.hwnd, noAltEnter)
 		}
 		call(r.swapChain, 0, uintptr(unsafe.Pointer(&iidIDXGISwapChain2)), uintptr(unsafe.Pointer(&r.swapChain2)))
-		if r.swapChain2 != 0 {
+		if r.swapChain2 != 0 && desc.Flags&swapChainWaitable != 0 {
 			// One frame waits ahead of the screen, which the frame
 			// latency object tells room for.
 			call(r.swapChain2, scSetMaxLatency, 1)
 			r.lat.handle = call(r.swapChain2, scLatencyWaitable)
 		}
-	} else if hr := call(r.swapChain, scResizeBuffers, uintptr(n), uintptr(bw), uintptr(bh), 0, swapChainWaitable); failed(hr) {
+	} else if hr := call(r.swapChain, scResizeBuffers, uintptr(n), uintptr(bw), uintptr(bh), 0, uintptr(r.swapChainFlags())); failed(hr) {
 		return fmt.Errorf("d3d11: cannot resize the swap chain: %#x", uint32(hr))
 	}
 	if err := r.setSourceSize(r.shown(w, h, bw, bh)); err != nil {
@@ -978,16 +1000,19 @@ func (r *Renderer) Render(s *scene.Scene) error {
 		return err
 	}
 	if !drawn {
-		r.waitRefresh()
+		if !r.uncapped {
+			r.waitRefresh()
+		}
 		return nil
 	}
 	// A frame of a new size is presented at once (sync interval 0), not
 	// after the frame queued before it, which would miss the next
 	// composition, and waits until the compositor shows it: the window
 	// takes its next size, as the user drags its border, with the frame of
-	// that size, rather than show older frames stretched to it.
+	// that size, rather than show older frames stretched to it. Uncapped,
+	// every frame presents at once, and the next follows (uncapped.go).
 	sync := uintptr(1)
-	if resized {
+	if resized || r.uncapped {
 		sync = 0
 	} else if r.presentLater != nil {
 		r.cost.read(r.ctx)
@@ -1801,9 +1826,9 @@ func (r *Renderer) show(sync uintptr) error {
 	var hr uintptr
 	if r.redrew == redrewPart {
 		params := presentParameters{DirtyRectsCount: uint32(len(r.part.Rects)), DirtyRects: unsafe.SliceData(r.part.Rects)}
-		hr = call(r.swapChain, scPresent1, sync, 0, uintptr(unsafe.Pointer(&params)))
+		hr = call(r.swapChain, scPresent1, sync, r.presentFlags(sync), uintptr(unsafe.Pointer(&params)))
 	} else {
-		hr = call(r.swapChain, scPresent, sync, 0)
+		hr = call(r.swapChain, scPresent, sync, r.presentFlags(sync))
 	}
 	if failed(hr) {
 		return fmt.Errorf("d3d11: present failed: %#x", uint32(hr))
@@ -1822,13 +1847,17 @@ func (r *Renderer) show(sync uintptr) error {
 
 // FrameInfo describes the last frame for MYGO_FRAME_STATS.
 func (r *Renderer) FrameInfo() string {
+	info := r.b.Summary()
 	switch r.redrew {
 	case redrewPart:
-		return fmt.Sprintf("redrew %s, %s", r.part.String(), r.b.Summary())
+		info = fmt.Sprintf("redrew %s, %s", r.part.String(), info)
 	case redrewNothing:
-		return "unchanged"
+		info = "unchanged"
 	}
-	return r.b.Summary()
+	if r.tearing {
+		info += ", tearing allowed"
+	}
+	return info
 }
 
 // sweepEvery is how many frames go by between sweeps. show sweeps once

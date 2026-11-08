@@ -87,6 +87,7 @@ framework safely. Read it before changing anything under `internal/`.
 │   ├── watchdriver/    the goroutine that runs a backend's file watcher
 │   ├── bridge/         embeds bridge.js, built from packages/bridge
 │   ├── surface/        the connection between a window and its native UI
+│   ├── pacing/         whether frames wait for the display (MYGO_UNCAPPED)
 │   ├── scene/          display lists and glyph atlases, what renderers draw
 │   ├── media/          the contract between ui's VideoPlayer and ui/video's engines
 │   ├── text/           fonts, shaping, line breaking, editing, glyph rasterization
@@ -3036,6 +3037,26 @@ either.
   `MYGO_FRAME_STATS` set, frames slower than its threshold log how long
   each part took, which path drew them, what the process allocated and
   whether the collector ran (`ui/framestats.go`).
+  With `MYGO_UNCAPPED=1`, which `internal/pacing` reads once (`Uncapped`),
+  frames wait for no refresh, for benchmarks, profiling and the least
+  latency (#1496): the next frame asked for starts once the last was
+  presented. Only the frames asked for come sooner, so an idle window
+  still draws nothing. The host holds no frame drawn in memory to the
+  refreshes (`refreshPresented`) and counts every surface's frames as
+  coming at once (`framesAtOnce`), so `Painter.AnimationFrameRate` keeps
+  its pace with the repaint timer; the backends and renderers each skip
+  their own wait: Direct3D's swap chain has no frame latency object, three
+  buffers and, where DXGI allows it, tearing, and presents every frame
+  with sync interval 0, without `waitComposed` or `waitRefresh`
+  (`internal/gpu/d3d11/uncapped.go`); macOS draws each frame from a
+  timer firing at once (`surface.frameSoon`), not the display link, into
+  a CAMetalLayer whose `displaySyncEnabled` is off; Linux tells GTK's frame
+  clock a refresh interval of a microsecond (`paceFrameClock`) and, on X11,
+  sets the GLX swap interval of the window GDK paints to 0
+  (`gl.UnsyncGLXSwaps`); browsers keep requestAnimationFrame's pace. On
+  Windows a frame of a new size still waits for DWM to show it. With
+  `MYGO_FRAME_STATS` too, the engine logs how many frames came each second
+  (`frameStats.rate`), and each frame's path says uncapped.
 - **Video of the system's media framework** (`ui/video`,
   `ui/engine_video.go`, `internal/media`, `scene.Surface`). A
   `media.Engine` plays one video: AVFoundation's `AVPlayer` with an
