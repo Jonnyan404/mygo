@@ -3062,7 +3062,15 @@ either.
   bounded, the frame of a new size's at two refreshes, with DwmFlush called
   on another thread (`waitShown`): called on the main thread within
   `SetWindowPos`, it was the one wait with no bound when a present took
-  2 s at the start or end of a resize the app made.
+  2 s at the start or end of a resize the app made. Nor does Present wait
+  long then: with no frame latency object to tell when the swap chain has
+  room, Present waited for it on the main thread, and a frame redrawn in
+  part still took 2 s in 2 resizes of 12, most likely queued behind
+  buffers DWM held. While resizing, frames present with
+  `DXGI_PRESENT_DO_NOT_WAIT`, tried for a refresh at most (`showSoon`);
+  one Present still refuses waits, unpresented, for the next composition
+  while the main thread takes its messages, or gives way to the next frame
+  drawn (`holdFrame`, `presentHeld`).
   With `MYGO_FRAME_STATS` too, the engine logs how many frames came each
   second (`frameStats.rate`), counted anew after a pause or a frame as long
   (250 ms), and each frame's path says uncapped.

@@ -2,7 +2,11 @@
 
 package d3d11
 
-import "unsafe"
+import (
+	"errors"
+	"time"
+	"unsafe"
+)
 
 // Uncapped (MYGO_UNCAPPED, package pacing), a frame presents as soon as it
 // is drawn, and the next draws at once: the swap chain is made without the
@@ -54,6 +58,39 @@ import "unsafe"
 // and then returns to the window's messages, leaves DWM nothing to wait
 // on, and a composition missed costs it two refreshes.
 //
+// Nor does Present itself wait long on the main thread while the window
+// changes size. With the frame of a new size's wait bounded, the
+// SetWindowPos resize still had one present take 2.0 s in 2 runs of 12 on
+// the Radeon 780M, once a second into the resize and once after its last
+// change, both of a frame not of a new size that redrew part of the last
+// (Present1 with dirty rectangles, sync interval 0, no flags). Such a
+// frame's wait for its composition is bounded and off the main thread; on
+// the main thread it calls nothing that may wait long but Present and,
+// every sweepEvery frames, DwmGetCompositionTimingInfo (readPeriod). Paced,
+// a frame presents only once the frame latency object said the swap chain
+// has room for it (latency.go), so its Present has nothing to wait for;
+// uncapped, there is no such object, and Present waits for room itself:
+// for the GPU to finish the frame before (one frame queued at most), which
+// waits for DWM to give its buffer back. DWM held up by the resize keeps
+// the buffers it holds, a frame drawn once the wait for its composition
+// timed out queues behind them, and Present then waits on DWM, which may
+// itself wait on the window's thread; that is the likeliest 2 s, though
+// nothing measured it. So while the window changes size, uncapped frames
+// present with DXGI_PRESENT_DO_NOT_WAIT (presentFlags), with which Present
+// returns DXGI_ERROR_WAS_STILL_DRAWING where it would wait. Present is tried
+// again for a refresh at most (showSoon), as long as the GPU or DWM take to
+// make room unless held up; after that the frame waits, unpresented
+// (holdFrame): the main thread goes back to the window's messages, the
+// frame after waits for it (Ready), and it presents after the next
+// composition, or two refreshes, tried as before (presentHeld). A frame
+// drawn meanwhile, as one of a new size within SetWindowPos, takes its
+// place, drawn whole as none showed it. Frame stats tell how many times
+// Present said it was still drawing, and a frame left to present later.
+// Nor does the main thread read the refresh period from DWM while the
+// window changes size (show): the period does not change with it. A swap
+// chain that takes no DXGI_PRESENT_DO_NOT_WAIT (DXGI_ERROR_INVALID_CALL)
+// presents without it, waiting as before (noWaitRefused).
+//
 // With two buffers, a frame presented with sync interval 0 that DWM has not
 // shown yet holds one and the screen the other, and the next frame waits
 // for the screen to give its buffer back, at the next refresh: the swap
@@ -73,7 +110,18 @@ const (
 	// uncappedBuffers is how many buffers an uncapped swap chain has at
 	// least.
 	uncappedBuffers = 3
+	// presentDoNotWait is DXGI_PRESENT_DO_NOT_WAIT, with which Present
+	// returns DXGI_ERROR_WAS_STILL_DRAWING rather than wait, and
+	// dxgiErrorInvalidCall DXGI_ERROR_INVALID_CALL, which it returns where
+	// the flag is not taken.
+	presentDoNotWait         = 0x8
+	dxgiErrorWasStillDrawing = 0x887a000a
+	dxgiErrorInvalidCall     = 0x887a0001
 )
+
+// errStillDrawing is what show returns when Present, with
+// DXGI_PRESENT_DO_NOT_WAIT, would have waited: the frame is not presented.
+var errStillDrawing = errors.New("d3d11: the swap chain has no room for the frame yet")
 
 var iidIDXGIFactory5 = guid{0x7632e1f5, 0xee65, 0x4dca, [8]byte{0x87, 0xfd, 0x84, 0xcd, 0x75, 0xf8, 0x83, 0x8d}}
 
@@ -107,12 +155,73 @@ func (r *Renderer) swapChainFlags() uint32 {
 
 // presentFlags returns the flags of a present after sync vertical blanks:
 // tearing's for one at once (sync 0), where the swap chain allows it and
-// frames present uncapped.
+// frames present uncapped; uncapped, while the window changes size,
+// DXGI_PRESENT_DO_NOT_WAIT, where the frame can present later (post) and
+// the swap chain takes it.
 func (r *Renderer) presentFlags(sync uintptr) uintptr {
-	if sync == 0 && r.tearing && r.presentsUncapped() {
+	switch {
+	case sync == 0 && r.tearing && r.presentsUncapped():
 		return presentTearing
+	case r.uncapped && r.resizing && r.post != nil && !r.noWaitRefused:
+		return presentDoNotWait
 	}
 	return 0
+}
+
+// showSoon presents the back buffer with DXGI_PRESENT_DO_NOT_WAIT, trying
+// again for at most a refresh while Present would wait, as for the GPU to
+// finish the last frame or DWM to give a buffer back, which takes that
+// long at most when DWM is not held up; then it returns errStillDrawing,
+// and the frame waits (holdFrame).
+func (r *Renderer) showSoon(sync uintptr) error {
+	deadline := time.Now().Add(r.cost.refreshPeriod())
+	for {
+		err := r.show(sync)
+		if err != errStillDrawing {
+			return err
+		}
+		r.refused++
+		if !time.Now().Before(deadline) {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// holdFrame returns err, a present's, but for errStillDrawing: the frame
+// drawn, which Present refused, then presents after the next composition,
+// or a refresh or two, from refreshed (presentHeld), while the main thread
+// goes back to the window's messages, and the frame after waits for that
+// (Ready). A frame drawn before, as one of a new size within SetWindowPos,
+// takes its place (Render).
+func (r *Renderer) holdFrame(err error) error {
+	if err != errStillDrawing {
+		return err
+	}
+	// The GPU draws the frame meanwhile.
+	call(r.ctx, ctxFlush)
+	r.unpresented = true
+	r.waitComposed()
+	return nil
+}
+
+// presentHeld presents the frame Present refused (holdFrame), or has it
+// wait again, and reports whether the frame after can draw now.
+func (r *Renderer) presentHeld() bool {
+	r.unpresented = false
+	err := r.present(0)
+	if err == nil {
+		// The frame after waits for the composition that shows it.
+		r.waitComposed()
+		return false
+	}
+	if err = r.holdFrame(err); err == nil {
+		return false
+	}
+	if r.failed == nil {
+		r.failed = err // the next frame finds it
+	}
+	return true
 }
 
 // presentsUncapped reports whether frames present without waiting for the

@@ -194,9 +194,9 @@ func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32) {
 			w, h = w+9, h+6
 		}
 		frame(w, h, false)
-		if !r.resizing || r.presentFlags(0) != 0 || r.pending || r.refreshing {
-			t.Fatalf("%s: a frame of a new size, %dx%d: resizing %v, present flags %#x, pending %v, refreshing %v; want resizing, no tearing, no wait",
-				kind, w, h, r.resizing, r.presentFlags(0), r.pending, r.refreshing)
+		if !r.resizing || r.presentFlags(0) != presentDoNotWait || r.pending || r.refreshing || r.unpresented {
+			t.Fatalf("%s: a frame of a new size, %dx%d: resizing %v, present flags %#x, pending %v, refreshing %v, unpresented %v; want resizing, no tearing, DXGI_PRESENT_DO_NOT_WAIT, no wait",
+				kind, w, h, r.resizing, r.presentFlags(0), r.pending, r.refreshing, r.unpresented)
 		}
 		if !strings.Contains(r.FrameInfo(), "paced while resizing") {
 			t.Fatalf("%s: a frame of a new size says %q", kind, r.FrameInfo())
@@ -234,6 +234,9 @@ func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32) {
 	}
 	if (r.presentFlags(0) == presentTearing) != wantTearing || strings.Contains(r.FrameInfo(), "paced") {
 		t.Fatalf("%s: after the resize, present flags %#x, frame %q", kind, r.presentFlags(0), r.FrameInfo())
+	}
+	if r.noWaitRefused {
+		t.Errorf("%s: the swap chain took no DXGI_PRESENT_DO_NOT_WAIT", kind)
 	}
 }
 
@@ -366,5 +369,229 @@ func resizeWhileDWMStalls(t *testing.T, r *Renderer, shown *atomic.Int32) {
 		if r.refreshing {
 			t.Fatalf("%s: after the resize, a frame waits for a composition", kind)
 		}
+	}
+}
+
+// TestUncappedResizePresentRefused checks that uncapped (MYGO_UNCAPPED),
+// while the window changes size, no frame waits in Present long on the
+// main thread: frames present with DXGI_PRESENT_DO_NOT_WAIT, and one that
+// Present refuses for a refresh (DXGI_ERROR_WAS_STILL_DRAWING) is left to
+// present after the next composition, the frame after waiting for it, or
+// gives way to a frame drawn meanwhile, as one of a new size within
+// SetWindowPos (holdFrame). A resize the app made with SetWindowPos every
+// 50 ms had a present of a frame redrawn in part take 2 s on a Radeon
+// 780M, most likely waiting in Present for DWM to give a buffer back.
+// Present here refuses for as long as the test says, as it would while DWM
+// is held up. The paced default, and frames once the swap chain settled,
+// present without the flag.
+func TestUncappedResizePresentRefused(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer func(on bool) { pacing.Uncapped = on }(pacing.Uncapped)
+	defer func(d time.Duration) { settleDelay = d }(settleDelay)
+	// The swap chain settles only once the test stops changing the size.
+	settleDelay = time.Second
+	defer func(f func(_, _ time.Duration)) { awaitRefresh = f }(awaitRefresh)
+	awaitRefresh = func(_, _ time.Duration) {}
+	// A hidden window's frame latency object is not signaled: paced frames
+	// wait for it no longer than this.
+	defer func(ms uintptr) { latencyTimeout = ms }(latencyTimeout)
+	latencyTimeout = 20
+	var p refusingPresent
+	defer func(f func(_, _, _ uintptr, _ *presentParameters) uintptr) { presentCall = f }(presentCall)
+	present := presentCall
+	presentCall = func(sc, sync, flags uintptr, params *presentParameters) uintptr {
+		p.flags = append(p.flags, flags)
+		if p.refuse && flags&presentDoNotWait != 0 {
+			p.refused++
+			return dxgiErrorWasStillDrawing
+		}
+		p.presented++
+		return present(sc, sync, flags, params)
+	}
+	for _, uncapped := range []bool{false, true} {
+		pacing.Uncapped = uncapped
+		for _, newRenderer := range []func(uintptr) (*Renderer, error){New, NewComposed} {
+			r, err := newRenderer(hiddenWindow(t, 200, 150))
+			if err != nil {
+				t.Skip("no Direct3D 11:", err)
+			}
+			p = refusingPresent{}
+			presentRefused(t, r, &p)
+			r.Release()
+		}
+	}
+}
+
+// refusingPresent stands for Present: while refuse, it refuses presents
+// with DXGI_PRESENT_DO_NOT_WAIT, counting them, and it counts those it
+// took (presented); flags are those of every call.
+type refusingPresent struct {
+	refuse             bool
+	refused, presented int
+	flags              []uintptr
+}
+
+// noWait reports whether a call to Present since the from'th had
+// DXGI_PRESENT_DO_NOT_WAIT.
+func (p *refusingPresent) noWait(from int) bool {
+	for _, f := range p.flags[from:] {
+		if f&presentDoNotWait != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func presentRefused(t *testing.T, r *Renderer, p *refusingPresent) {
+	t.Helper()
+	kind := "window"
+	if r.composed {
+		kind = "composition"
+	}
+	if !r.uncapped {
+		kind += ", paced"
+	}
+	posted := make(chan func(), 16)
+	r.SetPost(func(f func()) { posted <- f })
+	// A refresh, which Present is tried for, and time for a slow machine
+	// to draw, far below the 2 s seen.
+	tooLong := r.cost.refreshPeriod() + 200*time.Millisecond
+	colors := []scene.Color{{R: 24, G: 24, B: 27, A: 255}, {R: 250, G: 250, B: 250, A: 255}}
+	n := 0
+	// render draws a frame of w×h, changing the background, at once, as
+	// the window host does within SetWindowPos.
+	render := func(w, h int) {
+		t.Helper()
+		n++
+		start := time.Now()
+		if err := r.Render(&scene.Scene{Width: w, Height: h, Background: colors[n%2]}); err != nil {
+			t.Fatal(err)
+		}
+		if d := time.Since(start); r.uncapped && d > tooLong {
+			t.Errorf("%s: a %dx%d frame took %v, resizing %v; want at most %v", kind, w, h, d, r.resizing, tooLong)
+		}
+	}
+	// ready has the next frame wait until it can draw, as the window host
+	// does, running what the renderer posts meanwhile.
+	ready := func() {
+		t.Helper()
+		woke := false
+		if r.Ready(func() { woke = true }) {
+			return
+		}
+		for !woke {
+			wait.For(t, kind+": what the frame after waits for", posted)()
+		}
+	}
+	frame := func(w, h int) {
+		t.Helper()
+		ready()
+		render(w, h)
+	}
+	frame(200, 150)
+	if r.swapChain2 == 0 {
+		t.Skip("no IDXGISwapChain2: the swap chain resizes whole at each size")
+	}
+	for range 3 {
+		frame(200, 150)
+	}
+	if p.noWait(0) {
+		t.Fatalf("%s: before the resize, a present with DXGI_PRESENT_DO_NOT_WAIT: %#x", kind, p.flags)
+	}
+	w, h := 200, 150
+	if !r.uncapped {
+		// Paced, a live resize presents as it did, whatever Present says.
+		p.refuse = true
+		for range 4 {
+			w, h = w+17, h+9
+			frame(w, h)
+			frame(w, h)
+		}
+		if !r.resizing || p.noWait(0) || p.refused != 0 || r.unpresented {
+			t.Fatalf("%s: resizing %v, presents with DXGI_PRESENT_DO_NOT_WAIT %v, %d refused, unpresented %v; want resizing, none",
+				kind, r.resizing, p.noWait(0), p.refused, r.unpresented)
+		}
+		return
+	}
+
+	// A frame of a new size, which Present refuses for longer than a
+	// refresh, returns to the window's messages within about that, and
+	// waits to present.
+	p.refuse = true
+	w, h = w+17, h+9
+	ready()
+	from := len(p.flags)
+	render(w, h)
+	if !r.resizing || !r.unpresented || !r.refreshing || p.refused == 0 || !p.noWait(from) {
+		t.Fatalf("%s: a %dx%d frame of a new size Present refused: resizing %v, unpresented %v, refreshing %v, %d refused, flags %#x; want resizing, unpresented, refreshing, refused with DXGI_PRESENT_DO_NOT_WAIT",
+			kind, w, h, r.resizing, r.unpresented, r.refreshing, p.refused, p.flags[from:])
+	}
+	if info := r.FrameInfo(); !strings.Contains(info, "Present still drawing") || !strings.Contains(info, "presenting once DXGI can") {
+		t.Errorf("%s: a frame Present refused says %q", kind, info)
+	}
+	woke := false
+	if r.Ready(func() { woke = true }) {
+		t.Fatalf("%s: the frame after one waiting to present is ready", kind)
+	}
+	// Tried again after the composition, it waits again while refused.
+	refused := p.refused
+	start := time.Now()
+	wait.For(t, kind+": the composition the frame waits for", posted)()
+	if d := time.Since(start); d > tooLong {
+		t.Errorf("%s: trying the frame again took %v; want at most %v", kind, d, tooLong)
+	}
+	if woke || !r.unpresented || !r.refreshing || p.refused == refused {
+		t.Fatalf("%s: tried again while refused: woken %v, unpresented %v, refreshing %v, %d more refused; want waiting, unpresented, refused",
+			kind, woke, r.unpresented, r.refreshing, p.refused-refused)
+	}
+	// Once DXGI takes it, it presents, and the frame after waits for the
+	// composition that shows it.
+	p.refuse = false
+	presented := p.presented
+	for !woke {
+		wait.For(t, kind+": the frame's present and its composition", posted)()
+	}
+	if r.unpresented || p.presented != presented+1 {
+		t.Fatalf("%s: once taken: unpresented %v, %d presents; want one", kind, r.unpresented, p.presented-presented)
+	}
+
+	// A frame not of a new size, refused, gives way to the frame of the
+	// next size, drawn whole at once within SetWindowPos, and is never
+	// presented.
+	p.refuse = true
+	frame(w, h)
+	if !r.unpresented {
+		t.Fatalf("%s: a %dx%d frame Present refused does not wait to present", kind, w, h)
+	}
+	p.refuse = false
+	presented = p.presented
+	w, h = w-13, h-7
+	render(w, h)
+	if r.unpresented || r.redrew != redrewWhole || p.presented != presented+1 {
+		t.Fatalf("%s: a %dx%d frame of a new size after one refused: unpresented %v, redrew %v, %d presents; want whole, one",
+			kind, w, h, r.unpresented, r.redrew, p.presented-presented)
+	}
+	ready()
+	if p.presented != presented+1 {
+		t.Fatalf("%s: the frame refused presented after the one that took its place", kind)
+	}
+
+	// The frames after the last change, until one settles the swap chain,
+	// then present without the flag.
+	for end := time.Now().Add(settleDelay/2 + 20*time.Millisecond); time.Now().Before(end); {
+		frame(w, h)
+	}
+	frame(w, h)
+	if r.resizing {
+		t.Fatalf("%s: the swap chain did not settle", kind)
+	}
+	from = len(p.flags)
+	for range 3 {
+		frame(w, h)
+	}
+	if p.noWait(from) || r.unpresented || r.noWaitRefused {
+		t.Fatalf("%s: settled: presents with DXGI_PRESENT_DO_NOT_WAIT %v, unpresented %v, the flag refused %v; want none",
+			kind, p.noWait(from), r.unpresented, r.noWaitRefused)
 	}
 }
