@@ -3054,7 +3054,11 @@ either.
   clock a refresh interval of a microsecond (`paceFrameClock`) and, on X11,
   sets the GLX swap interval of the window GDK paints to 0
   (`gl.UnsyncGLXSwaps`); browsers keep requestAnimationFrame's pace. On
-  Windows a frame of a new size still waits for DWM to show it. With
+  Windows a live resize presents paced, from the window's first change of
+  size until the swap chain settles (`presentsUncapped`): no tearing, a
+  frame of a new size waiting for DWM to show it and the others for the
+  composition that shows each, as uncapped frames queued for DWM while it
+  resized the window, and one present took 2 s. With
   `MYGO_FRAME_STATS` too, the engine logs how many frames came each second
   (`frameStats.rate`), and each frame's path says uncapped.
 - **Video of the system's media framework** (`ui/video`,

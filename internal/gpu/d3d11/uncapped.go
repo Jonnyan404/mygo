@@ -16,8 +16,25 @@ import "unsafe"
 // display (independent flip, as a borderless window covering the screen
 // has); a window DWM composes still shows the newest frame at each refresh.
 // A swap chain for composition (NewComposed) has no tearing: its frames
-// present with sync interval 0 all the same. A frame of a new size still
-// waits for DWM to show it (Render), as a live resize needs.
+// present with sync interval 0 all the same.
+//
+// While the window changes size, from its first change until the swap
+// chain settles (resize, settleDelay), frames present paced
+// (presentsUncapped), as without MYGO_UNCAPPED: none with tearing, a frame
+// of a new size waiting for DWM to show it (Render, DwmFlush), the others
+// each waiting for the composition that shows it (waitComposed), and one
+// that changed nothing for the next refresh (waitRefresh). Uncapped, a live
+// resize had one present take 2 s, on a Radeon 780M and a 59 Hz display,
+// with the window resized every 50 ms while it animated, and frames then
+// came at 92 to 95 a second, about two a composition besides the resize's,
+// where paced frames took no more than a refresh. The resize's buffers are
+// larger than the window and shown clipped, so DWM composes the window and
+// flips none of its frames to the screen torn: frames presented faster than
+// DWM composes only queue for it, filling the buffers, while DWM resizes the
+// window, and the frame of the next size, which waits for DWM to show it,
+// waits behind them. Paced, at most one frame a composition reaches DWM.
+// Before ResizeBuffers, no view of the buffers stays bound (unbindBuffers),
+// as DXGI asks.
 //
 // With two buffers, a frame presented with sync interval 0 that DWM has not
 // shown yet holds one and the screen the other, and the next frame waits
@@ -71,10 +88,29 @@ func (r *Renderer) swapChainFlags() uint32 {
 }
 
 // presentFlags returns the flags of a present after sync vertical blanks:
-// tearing's for one at once (sync 0), where the swap chain allows it.
+// tearing's for one at once (sync 0), where the swap chain allows it and
+// frames present uncapped.
 func (r *Renderer) presentFlags(sync uintptr) uintptr {
-	if sync == 0 && r.tearing {
+	if sync == 0 && r.tearing && r.presentsUncapped() {
 		return presentTearing
 	}
 	return 0
+}
+
+// presentsUncapped reports whether frames present without waiting for the
+// display: uncapped (MYGO_UNCAPPED), but while the window changes size,
+// when they present paced.
+func (r *Renderer) presentsUncapped() bool {
+	return r.uncapped && !r.resizing
+}
+
+// unbindBuffers unbinds the render target views of the swap chain's
+// buffers from the device context and submits the commands drawing into
+// them, before ResizeBuffers, which needs no reference to the buffers
+// left: a view bound to the context is one. The context waits for the GPU
+// to be done with them by itself.
+func (r *Renderer) unbindBuffers() {
+	call(r.ctx, ctxOMSetRenderTargets, 0, 0, 0)
+	r.drawing = 0
+	call(r.ctx, ctxFlush)
 }

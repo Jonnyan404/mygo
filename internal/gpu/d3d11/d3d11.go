@@ -643,8 +643,13 @@ func (r *Renderer) buffers(w, h, bw, bh, n int) error {
 			call(r.swapChain2, scSetMaxLatency, 1)
 			r.lat.handle = call(r.swapChain2, scLatencyWaitable)
 		}
-	} else if hr := call(r.swapChain, scResizeBuffers, uintptr(n), uintptr(bw), uintptr(bh), 0, uintptr(r.swapChainFlags())); failed(hr) {
-		return fmt.Errorf("d3d11: cannot resize the swap chain: %#x", uint32(hr))
+	} else {
+		if r.uncapped {
+			r.unbindBuffers()
+		}
+		if hr := call(r.swapChain, scResizeBuffers, uintptr(n), uintptr(bw), uintptr(bh), 0, uintptr(r.swapChainFlags())); failed(hr) {
+			return fmt.Errorf("d3d11: cannot resize the swap chain: %#x", uint32(hr))
+		}
 	}
 	if err := r.setSourceSize(r.shown(w, h, bw, bh)); err != nil {
 		return err
@@ -1000,7 +1005,7 @@ func (r *Renderer) Render(s *scene.Scene) error {
 		return err
 	}
 	if !drawn {
-		if !r.uncapped {
+		if !r.presentsUncapped() {
 			r.waitRefresh()
 		}
 		return nil
@@ -1010,10 +1015,18 @@ func (r *Renderer) Render(s *scene.Scene) error {
 	// composition, and waits until the compositor shows it: the window
 	// takes its next size, as the user drags its border, with the frame of
 	// that size, rather than show older frames stretched to it. Uncapped,
-	// every frame presents at once, and the next follows (uncapped.go).
+	// every frame presents at once, and the next follows, but while the
+	// window changes size, when each frame waits for the composition that
+	// shows it (uncapped.go).
 	sync := uintptr(1)
-	if resized || r.uncapped {
+	if resized || r.presentsUncapped() {
 		sync = 0
+	} else if r.uncapped {
+		if err := r.present(0); err != nil {
+			return err
+		}
+		r.waitComposed()
+		return nil
 	} else if r.presentLater != nil {
 		r.cost.read(r.ctx)
 		if r.cost.fits() && r.lat.ready() {
@@ -1854,7 +1867,10 @@ func (r *Renderer) FrameInfo() string {
 	case redrewNothing:
 		info = "unchanged"
 	}
-	if r.tearing {
+	switch {
+	case r.uncapped && r.resizing:
+		info += ", paced while resizing"
+	case r.tearing:
 		info += ", tearing allowed"
 	}
 	return info
