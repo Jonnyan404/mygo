@@ -106,7 +106,10 @@ func TestUncappedSwapChain(t *testing.T) {
 // flooding DWM as it resized the window had a present take 2 s on a
 // Radeon 780M; WARP, without a display, may not show that, but the frames
 // are those of a live resize, the size changing every other frame, and no
-// frame may take near as long.
+// frame may take near as long. Real DXGI takes DXGI_PRESENT_DO_NOT_WAIT,
+// and a frame of a new size that it refused for a refresh, as WARP on a
+// busy runner may, waits to present (holdFrame) and presents before the
+// frame after draws.
 func TestUncappedResizePaced(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -115,6 +118,15 @@ func TestUncappedResizePaced(t *testing.T) {
 	var composed atomic.Int32
 	defer func(f func(_, _ time.Duration)) { awaitRefresh = f }(awaitRefresh)
 	awaitRefresh = func(_, _ time.Duration) { composed.Add(1) }
+	// Real DXGI presents, each call's flags and result recorded.
+	var calls []presentResult
+	defer func(f func(_, _, _ uintptr, _ *presentParameters) uintptr) { presentCall = f }(presentCall)
+	present := presentCall
+	presentCall = func(sc, sync, flags uintptr, params *presentParameters) uintptr {
+		hr := present(sc, sync, flags, params)
+		calls = append(calls, presentResult{flags, uint32(hr)})
+		return hr
+	}
 	pacing.Uncapped = true
 	// Frames come far sooner than half of it after the last change, so the
 	// swap chain settles only once the size stops changing.
@@ -124,12 +136,36 @@ func TestUncappedResizePaced(t *testing.T) {
 		if err != nil {
 			t.Skip("no Direct3D 11:", err)
 		}
-		uncappedResize(t, r, &composed)
+		uncappedResize(t, r, &composed, &calls)
 		r.Release()
 	}
 }
 
-func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32) {
+// presentResult is a call to Present: its flags and what it returned.
+type presentResult struct {
+	flags uintptr
+	hr    uint32
+}
+
+// lastPresent returns the last of calls, none for none.
+func lastPresent(calls []presentResult) presentResult {
+	if len(calls) == 0 {
+		return presentResult{}
+	}
+	return calls[len(calls)-1]
+}
+
+// presentedNoWait reports whether the call presented with
+// DXGI_PRESENT_DO_NOT_WAIT, and stillDrawing whether DXGI refused it.
+func (c presentResult) presentedNoWait() bool {
+	return c.flags&presentDoNotWait != 0 && !failed(uintptr(c.hr))
+}
+
+func (c presentResult) stillDrawing() bool {
+	return c.flags&presentDoNotWait != 0 && c.hr == dxgiErrorWasStillDrawing
+}
+
+func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32, calls *[]presentResult) {
 	t.Helper()
 	kind := "window"
 	if r.composed {
@@ -138,14 +174,19 @@ func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32) {
 	posted := make(chan func(), 16)
 	r.SetPost(func(f func()) { posted <- f })
 	// ready has the next frame wait until it can draw, as the window host
-	// does, and reports whether it waited.
+	// does, and reports whether it waited. A frame waiting to present is
+	// tried again at each composition, which comes at once here: DXGI
+	// takes it long before the guard.
 	ready := func() bool {
 		t.Helper()
 		woke := false
 		if r.Ready(func() { woke = true }) {
 			return false
 		}
-		for !woke {
+		for end := time.Now().Add(wait.Guard); !woke; {
+			if time.Now().After(end) {
+				t.Fatalf("%s: the frame after one waiting to present never drew (waited %v)", kind, wait.Guard)
+			}
 			wait.For(t, kind+": the composition a frame waits for", posted)()
 		}
 		return true
@@ -153,8 +194,10 @@ func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32) {
 	const tooLong = 200 * time.Millisecond
 	colors := []scene.Color{{R: 24, G: 24, B: 27, A: 255}, {R: 250, G: 250, B: 250, A: 255}}
 	n := 0
-	// frame draws and presents a frame of w×h, which changes the
-	// background unless same, and reports whether it waited to start.
+	// frame draws and presents a frame of w×h, which changes what it starts
+	// with and the background unless same, and reports whether it waited to
+	// start: a swap chain for composition shows no background, and a frame
+	// changing it alone would present nothing.
 	frame := func(w, h int, same bool) bool {
 		t.Helper()
 		waited := ready()
@@ -162,7 +205,7 @@ func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32) {
 			n++
 		}
 		start := time.Now()
-		if err := r.Render(&scene.Scene{Width: w, Height: h, Background: colors[n%2]}); err != nil {
+		if err := r.Render(&scene.Scene{Width: w, Height: h, Clear: colors[n%2], Background: colors[n%2]}); err != nil {
 			t.Fatal(err)
 		}
 		if d := time.Since(start); d > tooLong {
@@ -186,6 +229,7 @@ func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32) {
 	// A live resize: growing, shrinking within the buffers and growing past
 	// them, the size changing every other frame.
 	w, h := 200, 150
+	held := 0
 	for i := range 24 {
 		switch {
 		case i%6 == 5:
@@ -194,12 +238,34 @@ func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32) {
 			w, h = w+9, h+6
 		}
 		frame(w, h, false)
-		if !r.resizing || r.presentFlags(0) != presentDoNotWait || r.pending || r.refreshing || r.unpresented {
-			t.Fatalf("%s: a frame of a new size, %dx%d: resizing %v, present flags %#x, pending %v, refreshing %v, unpresented %v; want resizing, no tearing, DXGI_PRESENT_DO_NOT_WAIT, no wait",
-				kind, w, h, r.resizing, r.presentFlags(0), r.pending, r.refreshing, r.unpresented)
+		if r.noWaitRefused {
+			t.Fatalf("%s: the swap chain took no DXGI_PRESENT_DO_NOT_WAIT", kind)
 		}
-		if !strings.Contains(r.FrameInfo(), "paced while resizing") {
-			t.Fatalf("%s: a frame of a new size says %q", kind, r.FrameInfo())
+		if !r.resizing || r.presentFlags(0) != presentDoNotWait || r.pending {
+			t.Fatalf("%s: a frame of a new size, %dx%d: resizing %v, present flags %#x, pending %v; want resizing, no tearing, DXGI_PRESENT_DO_NOT_WAIT, none pending",
+				kind, w, h, r.resizing, r.presentFlags(0), r.pending)
+		}
+		info := r.FrameInfo()
+		if !strings.Contains(info, "paced while resizing") {
+			t.Fatalf("%s: a frame of a new size says %q", kind, info)
+		}
+		if r.unpresented {
+			// DXGI refused it for a refresh: the frame waits to present,
+			// the main thread back to the window's messages, and presents
+			// before the frame after draws.
+			held++
+			if last := lastPresent(*calls); !r.refreshing || !last.stillDrawing() || !strings.Contains(info, "presenting once DXGI can") {
+				t.Fatalf("%s: a frame of a new size, %dx%d, waiting to present: refreshing %v, last present %#x (flags %#x), says %q; want waiting for the composition, refused with DXGI_PRESENT_DO_NOT_WAIT",
+					kind, w, h, r.refreshing, last.hr, last.flags, info)
+			}
+			ready()
+			if last := lastPresent(*calls); r.unpresented || !last.presentedNoWait() {
+				t.Fatalf("%s: a frame of a new size, %dx%d, waiting to present: unpresented %v, last present %#x (flags %#x) once the frame after can draw; want presented with DXGI_PRESENT_DO_NOT_WAIT",
+					kind, w, h, r.unpresented, last.hr, last.flags)
+			}
+		} else if last := lastPresent(*calls); r.refreshing || !last.presentedNoWait() {
+			t.Fatalf("%s: a frame of a new size, %dx%d: refreshing %v, last present %#x (flags %#x); want no wait, presented with DXGI_PRESENT_DO_NOT_WAIT",
+				kind, w, h, r.refreshing, last.hr, last.flags)
 		}
 		before := composed.Load()
 		frame(w, h, false)
@@ -219,6 +285,9 @@ func uncappedResize(t *testing.T, r *Renderer, composed *atomic.Int32) {
 		if composed.Load() == before {
 			t.Fatalf("%s: frames while resizing waited for no composition", kind)
 		}
+	}
+	if held > 0 {
+		t.Logf("%s: %d of 24 frames of a new size waited to present, DXGI refusing them for a refresh", kind, held)
 	}
 	// Once the size stopped changing, a frame settles the swap chain, and
 	// frames present uncapped again.
@@ -349,9 +418,16 @@ func resizeWhileDWMStalls(t *testing.T, r *Renderer, shown *atomic.Int32) {
 		}
 		before := shown.Load()
 		frame(w, h)
-		if !r.resizing || shown.Load() != before+1 {
-			t.Fatalf("%s: a %dx%d frame of a new size: resizing %v, %d waits for DWM to show it; want resizing, one",
-				kind, w, h, r.resizing, shown.Load()-before)
+		// It waits for DWM to show it once presented; one DXGI refused for
+		// a refresh, as WARP on a busy runner may, waits to present
+		// instead, and the frame after for it (holdFrame).
+		want := before + 1
+		if r.unpresented {
+			want = before
+		}
+		if !r.resizing || shown.Load() != want {
+			t.Fatalf("%s: a %dx%d frame of a new size: resizing %v, waiting to present %v, %d waits for DWM to show it; want resizing, %d",
+				kind, w, h, r.resizing, r.unpresented, shown.Load()-before, want-before)
 		}
 		frame(w, h)
 		frame(w, h)
@@ -382,7 +458,7 @@ func resizeWhileDWMStalls(t *testing.T, r *Renderer, shown *atomic.Int32) {
 // 50 ms had a present of a frame redrawn in part take 2 s on a Radeon
 // 780M, most likely waiting in Present for DWM to give a buffer back.
 // Present here refuses for as long as the test says, as it would while DWM
-// is held up. The paced default, and frames once the swap chain settled,
+// is held up, and only then. The paced default, and frames once the swap chain settled,
 // present without the flag.
 func TestUncappedResizePresentRefused(t *testing.T) {
 	runtime.LockOSThread()
@@ -402,9 +478,15 @@ func TestUncappedResizePresentRefused(t *testing.T) {
 	present := presentCall
 	presentCall = func(sc, sync, flags uintptr, params *presentParameters) uintptr {
 		p.flags = append(p.flags, flags)
-		if p.refuse && flags&presentDoNotWait != 0 {
-			p.refused++
-			return dxgiErrorWasStillDrawing
+		if flags&presentDoNotWait != 0 {
+			if p.refuse {
+				p.refused++
+				return dxgiErrorWasStillDrawing
+			}
+			// Only the test refuses: real DXGI, which may refuse too on a
+			// busy runner (TestUncappedResizePaced), takes the frame as it
+			// would without the flag.
+			flags &^= presentDoNotWait
 		}
 		p.presented++
 		return present(sc, sync, flags, params)
@@ -459,13 +541,15 @@ func presentRefused(t *testing.T, r *Renderer, p *refusingPresent) {
 	tooLong := r.cost.refreshPeriod() + 200*time.Millisecond
 	colors := []scene.Color{{R: 24, G: 24, B: 27, A: 255}, {R: 250, G: 250, B: 250, A: 255}}
 	n := 0
-	// render draws a frame of w×h, changing the background, at once, as
-	// the window host does within SetWindowPos.
+	// render draws a frame of w×h, changing what it starts with and the
+	// background, at once, as the window host does within SetWindowPos: a
+	// swap chain for composition shows no background, and a frame changing
+	// it alone would present nothing.
 	render := func(w, h int) {
 		t.Helper()
 		n++
 		start := time.Now()
-		if err := r.Render(&scene.Scene{Width: w, Height: h, Background: colors[n%2]}); err != nil {
+		if err := r.Render(&scene.Scene{Width: w, Height: h, Clear: colors[n%2], Background: colors[n%2]}); err != nil {
 			t.Fatal(err)
 		}
 		if d := time.Since(start); r.uncapped && d > tooLong {

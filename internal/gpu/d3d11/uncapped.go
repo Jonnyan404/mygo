@@ -84,7 +84,12 @@ import (
 // frame after waits for it (Ready), and it presents after the next
 // composition, or two refreshes, tried as before (presentHeld). A frame
 // drawn meanwhile, as one of a new size within SetWindowPos, takes its
-// place, drawn whole as none showed it. Frame stats tell how many times
+// place, drawn whole as none showed it. A frame of a new size that Present
+// refuses for a refresh waits so too, its wait for DWM to show it
+// (waitShown) left out, rather than wait in Present within SetWindowPos,
+// where DWM may wait on the window's thread: the window shows the last
+// frame at its new size until it presents, a composition or two later,
+// which WARP on a busy CI runner does too. Frame stats tell how many times
 // Present said it was still drawing, and a frame left to present later.
 // Nor does the main thread read the refresh period from DWM while the
 // window changes size (show): the period does not change with it. A swap
