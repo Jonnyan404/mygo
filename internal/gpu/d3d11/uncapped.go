@@ -89,9 +89,17 @@ import (
 // (waitShown) left out, rather than wait in Present within SetWindowPos,
 // where DWM may wait on the window's thread: the window shows the last
 // frame at its new size until it presents, a composition or two later,
-// which WARP on a busy CI runner does too. Frame stats tell how many times
-// Present said it was still drawing, and a frame left to present later.
-// Nor does the main thread read the refresh period from DWM while the
+// which WARP on a busy CI runner does too. A frame waits so maxHeld at
+// most, or until the next frame would settle the swap chain: then it is
+// given up on, never presented, and the frame after draws, whole, at once
+// if one waits for it, or once the window asks for one (askFrame), as no
+// frame may follow. Without that bound, on the Radeon 780M, 2 runs of 30
+// SetWindowPos resizes held their last frame, and nothing drew for the 2
+// to 3.5 s the app ran on: the frame after waited for it, which never
+// presented, most likely as DXGI took it no sooner, though nothing
+// measured that. Frame stats tell how many times Present said it was still
+// drawing, a frame left to present later, and a frame after one given up
+// on. Nor does the main thread read the refresh period from DWM while the
 // window changes size (show): the period does not change with it. A swap
 // chain that takes no DXGI_PRESENT_DO_NOT_WAIT (DXGI_ERROR_INVALID_CALL)
 // presents without it, waiting as before (noWaitRefused).
@@ -198,7 +206,8 @@ func (r *Renderer) showSoon(sync uintptr) error {
 // or a refresh or two, from refreshed (presentHeld), while the main thread
 // goes back to the window's messages, and the frame after waits for that
 // (Ready). A frame drawn before, as one of a new size within SetWindowPos,
-// takes its place (Render).
+// takes its place (Render), and one that waited too long gives way to the
+// frame after (presentHeld).
 func (r *Renderer) holdFrame(err error) error {
 	if err != errStillDrawing {
 		return err
@@ -206,14 +215,34 @@ func (r *Renderer) holdFrame(err error) error {
 	// The GPU draws the frame meanwhile.
 	call(r.ctx, ctxFlush)
 	r.unpresented = true
+	if r.heldAt.IsZero() {
+		r.heldAt = time.Now()
+	}
 	r.waitComposed()
 	return nil
 }
 
+// maxHeld is how long a frame waits to present at most (presentHeld);
+// tests change it.
+var maxHeld = 100 * time.Millisecond
+
+// askFrame has the window ask for a frame, as the settle timer does
+// (armSettle); tests replace it.
+var askFrame = func(hwnd uintptr) { procInvalidateRect.Call(hwnd, 0, 0) }
+
 // presentHeld presents the frame Present refused (holdFrame), or has it
-// wait again, and reports whether the frame after can draw now.
+// wait again, and reports whether the frame after can draw now. A frame
+// that waited maxHeld, or once the next frame settles the swap chain, is
+// given up on: the frame after draws, whole as DXGI never showed this
+// one, now if it waits (Ready), or once the window asks for it should
+// nothing wait.
 func (r *Renderer) presentHeld() bool {
 	r.unpresented = false
+	if time.Since(r.heldAt) >= maxHeld || r.settleDue() {
+		r.dropped = true
+		askFrame(r.hwnd)
+		return true
+	}
 	err := r.present(0)
 	if err == nil {
 		// The frame after waits for the composition that shows it.

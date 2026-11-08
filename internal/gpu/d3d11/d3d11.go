@@ -329,13 +329,17 @@ type Renderer struct {
 	// uncapped tells that frames present without waiting for the display
 	// (uncapped.go), and tearing that they present with tearing. While the
 	// window changes size, uncapped, unpresented tells that the frame drawn
-	// waits to present, as Present would have waited (holdFrame), refused
-	// how many times Present said so this frame, and noWaitRefused that
-	// the swap chain took no DXGI_PRESENT_DO_NOT_WAIT.
-	uncapped, tearing bool
-	unpresented       bool
-	refused           int
-	noWaitRefused     bool
+	// waits to present, as Present would have waited (holdFrame), since
+	// heldAt, refused how many times Present said so this frame, and
+	// noWaitRefused that the swap chain took no DXGI_PRESENT_DO_NOT_WAIT;
+	// dropped tells that the frame held was given up on (presentHeld), and
+	// afterDropped that the frame drawn followed one given up on.
+	uncapped, tearing     bool
+	unpresented           bool
+	heldAt                time.Time
+	refused               int
+	noWaitRefused         bool
+	dropped, afterDropped bool
 
 	vs, ps, layout      uintptr
 	blend, raster, samp uintptr
@@ -577,7 +581,7 @@ var settleDelay = time.Second
 // resize makes the swap chain show w×h pixels.
 func (r *Renderer) resize(w, h int) error {
 	if r.swapChain != 0 && w == r.w && h == r.h {
-		if r.resizing && time.Since(r.resizedAt) >= settleDelay/2 {
+		if r.settleDue() {
 			r.resizing = false
 			return r.buffers(w, h, w, h, 2)
 		}
@@ -597,6 +601,12 @@ func (r *Renderer) resize(w, h int) error {
 	}
 	r.resizing = true
 	return r.buffers(w, h, w+w/4+64, h+h/4+64, resizeBuffers)
+}
+
+// settleDue reports whether the next frame, of the size the swap chain
+// shows, settles it: settleDelay/2 after the window last changed size.
+func (r *Renderer) settleDue() bool {
+	return r.resizing && time.Since(r.resizedAt) >= settleDelay/2
 }
 
 // buffers makes the swap chain n buffers of bw×bh pixels, which shows w×h
@@ -843,7 +853,7 @@ func (r *Renderer) armSettle() {
 
 // Release frees the renderer's GPU objects.
 func (r *Renderer) Release() {
-	r.pending, r.refreshing, r.wake, r.unpresented = false, false, nil, false
+	r.pending, r.refreshing, r.wake, r.unpresented, r.dropped = false, false, nil, false, false
 	r.lat.release()
 	r.cost.release()
 	r.b.Release()
@@ -1011,7 +1021,8 @@ func (r *Renderer) Render(s *scene.Scene) error {
 	// A frame DXGI could not present yet while the window changes size,
 	// uncapped, gives way to this one, drawn whole as it never showed
 	// (holdFrame).
-	r.unpresented, r.refused = false, 0
+	r.unpresented, r.heldAt, r.refused = false, time.Time{}, 0
+	r.afterDropped, r.dropped = r.dropped, false
 	resized := r.swapChain != 0 && (s.Width != r.w || s.Height != r.h)
 	drawn, err := r.drawFrame(s)
 	if err != nil {
@@ -1936,6 +1947,9 @@ func (r *Renderer) FrameInfo() string {
 		}
 	case r.tearing:
 		info += ", tearing allowed"
+	}
+	if r.afterDropped {
+		info += ", after a frame DXGI never took"
 	}
 	return info
 }

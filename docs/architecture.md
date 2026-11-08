@@ -3070,7 +3070,11 @@ either.
   `DXGI_PRESENT_DO_NOT_WAIT`, tried for a refresh at most (`showSoon`);
   one Present still refuses waits, unpresented, for the next composition
   while the main thread takes its messages, or gives way to the next frame
-  drawn (`holdFrame`, `presentHeld`).
+  drawn (`holdFrame`, `presentHeld`). One still not taken after `maxHeld`
+  (100 ms), or once the next frame would settle the swap chain, is dropped,
+  and the next frame draws, at once if one waits, or once the window asks
+  for one (`askFrame`): a resize's last frame held for good otherwise left
+  nothing drawing.
   With `MYGO_FRAME_STATS` too, the engine logs how many frames came each
   second (`frameStats.rate`), counted anew after a pause or a frame as long
   (250 ms), and each frame's path says uncapped.
